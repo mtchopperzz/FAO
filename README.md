@@ -1,4 +1,4 @@
-このプログラムはAlex Vinogradov(https://scholar.google.com/citations?user=fVm6Lv4AAAAJ&hl=en,https://github.com/avngrdv)に作られたFastqProcessorより発展されたものです。
+このプログラムはAlex Vinogradov (https://scholar.google.com/citations?user=fVm6Lv4AAAAJ&hl=en; https://github.com/avngrdv) に作られたFastqProcessorより発展されたものです。
 彼の元生徒として、私は大学院課程での彼の援助とアドバイス、そして FastProcessor をオープンソース化してくれたことに深く感謝し、尊敬しています。
 
 
