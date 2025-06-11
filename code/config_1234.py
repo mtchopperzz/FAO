@@ -1,7 +1,7 @@
 import os
 from utils.lib_design import LibraryDesign
 
-experiment = '4685_VH_test'
+experiment = '1234_VH_test'
 
 class constants:
     '''
@@ -73,7 +73,7 @@ class ParserConfig:
     P_design = LibraryDesign(
         
                     templates=[
-                                '1121TVDLKITSPTTEDTATYFCAR111111111111WGPGTLVTVSS1111',
+                                '1121ACDEFG111111111111HIKL1111',
                               ],
             
                     monomers={
