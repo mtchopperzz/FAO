@@ -817,7 +817,7 @@ class FastqParser(Handler):
                     Transformed Data object containg entries with specified constant regions
         """
 
-    # ---------- sanity check -------------------------------------------
+    #sanity check
         self._where_check(where)
         design = self.P_design if where == "pep" else self.D_design
         self._loc_check(loc, design)
@@ -826,19 +826,18 @@ class FastqParser(Handler):
         if not isinstance(tol, int):
             raise ValueError("tol must be int")
 
-    # ---------- pre-compute reference strings for every template --------
+    #pre-compute reference strings for every template
         ref_blocks = []
         for tpl in design:
             block_seq = "".join(tpl(loc))
             ref_blocks.append(block_seq)
 
-    # ---------- helper: Hamming distance --------------------------------
+    #helper: Hamming distance
         def _hd(a: str, b: str) -> int:
             if len(a) != len(b):                     # safety
                 return abs(len(a) - len(b)) + sum(x!=y for x,y in zip(a,b))
             return sum(x != y for x, y in zip(a, b))
 
-    # ---------- actual op -----------------------------------------------
         def constant_region_fuzzy_filter(data):
             for sample in data:
                 self._transform_check(sample, inspect.stack()[0][3])
@@ -906,7 +905,7 @@ class FastqParser(Handler):
     callable  – suitable for Pipeline.enque()
     """
 
-    # ---------- sanity checks ------------------------------------------
+    #sanity checks
         if mode not in ("cr", "vr"):
             raise ValueError("mode must be 'cr' or 'vr'")
 
@@ -920,18 +919,10 @@ class FastqParser(Handler):
         if mode == "vr" and not np.all(design.is_vr[loc]):
             raise AssertionError("loc for mode='vr' must point to variable regions.")
 
-        #if mode == "vr":
-        # for every VR index we will need its *left* and *right* constant neighbours
-        #    for r in loc:
-        #        if r == 0 or r == design.loc.max():
-        #            raise AssertionError("Edge variable region has no two flanking constants")
-        #        if design.is_vr[r-1] or design.is_vr[r+1]:
-        #            raise AssertionError("Variable region must be flanked by constants")
-
         if not isinstance(tol, int) or tol < 0:
             raise ValueError("tol must be a non-negative int")
 
-    # ---------- helpers ------------------------------------------------
+    #helpers
         def _hamming(a: str, b: str) -> int:
             """Return Hamming distance between equal-length strings."""
             return sum(x != y for x, y in zip(a, b))
@@ -953,9 +944,7 @@ class FastqParser(Handler):
                         right_blocks[k] = "".join(tpl([k+1]))
                 refs.append( (left_blocks, right_blocks) )
 
-
-    # ---------- main op ------------------------------------------------
-        def _mask_fuzzy(data):
+        def mask_fuzzy(data):
             for sample in data:
                 self._transform_check(sample, inspect.stack()[0][3])
                 arr  = sample[where]
@@ -969,7 +958,6 @@ class FastqParser(Handler):
                                 np.ones(len(arr), bool))
 
                     if mode == "cr":
-                        # ---- constant region masking (unchanged) ----
                         for ridx in np.where(row_mask)[0]:
                             s = seqs[ridx]
                             for block in refs[t_idx]:
@@ -980,14 +968,12 @@ class FastqParser(Handler):
                                         break
 
                     else:
-                        # ---- variable region masking (new logic) ----
                         left_map, right_map = refs[t_idx]
 
                         for ridx in np.where(row_mask)[0]:
                             s = seqs[ridx]
 
                             for k in loc:
-                                # ---- find left anchor (if any) ----
                                 p_left = 0
                                 if k in left_map:
                                     Lc   = len(left_map[k])
@@ -998,13 +984,12 @@ class FastqParser(Handler):
                                             best, p_left = d, p
                                             if best == 0:
                                                 break
-                                    if best > tol:               # anchor not found
+                                    if best > tol:
                                         continue
                                     p_var_start = p_left + Lc
                                 else:
-                                    p_var_start = 0              # VR at N-terminus
+                                    p_var_start = 0
 
-                                # ---- find right anchor (if any) ----
                                 p_var_end = len(s)
                                 if k in right_map:
                                     Rc   = len(right_map[k])
@@ -1019,18 +1004,15 @@ class FastqParser(Handler):
                                     if best > tol:
                                         continue
                                     p_var_end = p_right
-                                # else VR at C-terminus → run to end
 
-                                # ---- mask the variable stretch ----
                                 if p_var_end > p_var_start:
                                     bool_mask[ridx, p_var_start:p_var_end] = False
 
-            # ---------- write the token ----------
                 arr[~bool_mask] = mask_token
                 sample[where] = arr
             return data
 
-        return _mask_fuzzy
+        return mask_fuzzy
 
     def vr_filter(self, where=None, loc=None, sets=None):
         '''
@@ -1335,7 +1317,7 @@ class FastqParser(Handler):
         -------
         callable  – ready to `pip.enque()`
         """
-        # ---------- sanity checks -----------------------------------------
+        #sanity checks
         self._where_check(where)
         design = self.P_design if where == "pep" else self.D_design
         self._loc_check(loc, design)
@@ -1343,7 +1325,7 @@ class FastqParser(Handler):
         if not isinstance(tol, int) or tol < 0:
             raise ValueError("tol must be a non-negative int")
 
-        # ---------- helper ------------------------------------------------
+        #helper
         def _ham(a: str, b: str) -> int:
             return sum(x != y for x, y in zip(a, b))              # Hamming
 
@@ -1356,8 +1338,7 @@ class FastqParser(Handler):
                     a[r] = "".join(tpl([r]))          # constant block
             anchors.append(a)
 
-        # ---------- main op ----------------------------------------------
-        def _fetch_fuzzy(data):
+        def fetch_fuzzy(data):
             for sample in data:
                 self._transform_check(sample, inspect.stack()[0][3])
 
@@ -1383,8 +1364,6 @@ class FastqParser(Handler):
 
                     for r in loc:
                         if design.is_vr[r]:
-                            # variable region – need its left/right constants
-                            # ----- left boundary --------------------------
                             left_end = 0
                             if r-1 in tpl_anchor:              # has left CR
                                 ref = tpl_anchor[r-1]; Lc = len(ref)
@@ -1396,7 +1375,6 @@ class FastqParser(Handler):
                                         if best == 0: break
                                 if best > tol: continue        # no anchor → skip
                                 left_end = pos + Lc
-                            # ----- right boundary -------------------------
                             right_start = len(seq)
                             if r+1 in tpl_anchor:              # has right CR
                                 ref = tpl_anchor[r+1]; Rc = len(ref)
@@ -1438,7 +1416,7 @@ class FastqParser(Handler):
 
             return data
 
-        return _fetch_fuzzy
+        return fetch_fuzzy
 
     def unpad(self):
         '''
