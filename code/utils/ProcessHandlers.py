@@ -11,6 +11,70 @@ from utils.datatypes import Data, SequencingSample
 import numpy as np
 import pandas as pd
 
+import numba as nb
+# Build global lookup table (Numba friendly)
+
+_AA_ALPHABET = np.asarray(list("ABCDEFGHIJKLMNOPQRSTUVWXYZ+*_"), dtype="<U1")
+
+_AA2INT_LUT = np.full(128, -1, dtype=np.int8)  # for ASCII 0-127
+
+for i, c in enumerate(_AA_ALPHABET):
+
+    _AA2INT_LUT[ord(c)] = i
+
+
+
+@nb.njit
+
+def encode_string(s):
+
+    out = np.empty(len(s), dtype=np.int8)
+
+    for i in range(len(s)):
+
+        ch = s[i]
+
+        code = ord(ch)
+
+        if code >= 128 or _AA2INT_LUT[code] == -1:
+
+            raise ValueError(f"Unknown character {ch}")
+
+        out[i] = _AA2INT_LUT[code]
+
+    return out
+
+
+
+@nb.njit
+
+def match_block(read, block, tol):
+
+    n = read.size
+
+    m = block.size
+
+    for i in range(n - m + 1):
+
+        err = 0
+
+        for j in range(m):
+
+            if read[i + j] != block[j]:
+
+                err += 1
+
+                if err > tol:
+
+                    break
+
+        if err <= tol:
+
+            return True
+
+    return False
+    
+
 class Logger:
     '''
     A decorated version of the standard python logger object.
@@ -319,6 +383,347 @@ class Pipeline(Handler):
         
         return data   
 
+
+    def run_over_stream(self, data_iter_factory, save_summary=True):
+        """
+        Like .run(), but consumes a stream (generator factory) of chunked Data.
+        Apply the queued ops to each chunk sequentially and log a single summary.
+        """
+        summary = []
+        # Build prettified text for chunk ID
+        chunk_idx = 0
+        for data in data_iter_factory():
+            chunk_idx += 1
+            for func in self.que:
+                t0 = time.time()
+                # collect pre-op description
+                data_descr = self._describe_data(data)
+                # apply op
+                data = func(data)
+                op_time = time.time() - t0
+                summary.append({'chunk': chunk_idx,
+                                'op': func.__name__,
+                                'op_time': op_time,
+                                'data_description': data_descr})
+        if save_summary and summary:
+            summary = self._reassemble_summary(summary)
+            fname = f'{self.exp_name}_streaming_pipeline_summary.csv'
+            path = os.path.join(self.dirs.logs, fname)
+            summary.to_csv(path)
+        return None
+
+    # --- Post-processing: merge chunked outputs -------------------------------- 
+    def merge_chunk_outputs(self, root_dirs=None, delete_chunks: bool = True):
+        """
+        Simplified merger for layouts like:
+          <parent>/<base>__chunk1/<base>__chunk1_pep_count_summary.fasta
+          <parent>/<base>__chunk2/<base>__chunk2_pep_count_summary.fasta
+        It merges files across all chunk dirs by stripping '__chunkN' from the filename.
+
+        FASTA behavior (fixed header '...count_<N>'):
+          - Parse each record as:
+              > ... count_<N>
+              SEQUENCE
+            Sum counts by SEQUENCE (whitespace removed, uppercased).
+          - Write merged FASTA to <parent>/<base>/<base>_... with headers:
+              >seq_<rank>_count_<SUM>
+              SEQUENCE (wrapped as-is, no wrapping added)
+
+        CSV behavior (if present):
+          - Sum 'count' by sequence column (pep/dna/sequence/seq), re-rank globally.
+
+        NPY: vertical concat (axis=0) of compatible shapes.
+
+        Args:
+            root_dirs: list of directories to scan. Defaults to [self.dirs.parser_out, self.dirs.logs].
+            delete_chunks: remove per-chunk files and empty chunk dirs after merge.
+        """
+        import os, re, csv
+        from collections import defaultdict, OrderedDict
+        import numpy as np
+
+        # ---------- resolve roots ----------
+        roots = []
+        if root_dirs:
+            roots = list(root_dirs)
+        else:
+            for attr in ("parser_out", "logs"):
+                if hasattr(self.dirs, attr):
+                    d = getattr(self.dirs, attr)
+                    if isinstance(d, str) and os.path.isdir(d):
+                        roots.append(d)
+        if not roots:
+            self.logger.warning("merge_chunk_outputs: no directories to scan.")
+            return
+
+        chunk_dir_re = re.compile(r"^(?P<base>.+)__chunk\d+$")
+        strip_chunk_in_name = re.compile(r"__chunk\d+")
+
+        def _norm_seq(s: str) -> str:
+            return "".join(str(s).split()).upper()
+
+        # count_<N> only (your fixed format)
+        COUNT_RE = re.compile(r"count_(\d+)", re.IGNORECASE)
+
+        def _read_fasta_counts(path: str):
+            """
+            Read FASTA with headers containing 'count_<N>'.
+            Returns list[(sequence_str, count_int)].
+            """
+            items, count, seq_lines = [], None, []
+            with open(path, "r") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    if line.startswith(">"):
+                        # flush previous record
+                        if count is not None and seq_lines:
+                            seq = _norm_seq("".join(seq_lines))
+                            if seq:
+                                items.append((seq, count))
+                        # parse new header
+                        m = COUNT_RE.search(line)
+                        count = int(m.group(1)) if m else 1
+                        seq_lines = []
+                    else:
+                        seq_lines.append(line)
+            if count is not None and seq_lines:
+                seq = _norm_seq("".join(seq_lines))
+                if seq:
+                    items.append((seq, count))
+            return items
+
+        def _write_merged_fasta(counts: dict[str, int], outpath: str):
+            os.makedirs(os.path.dirname(outpath), exist_ok=True)
+            # sort by descending count, then lexicographically
+            items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            with open(outpath, "w") as out:
+                for rank, (seq, cnt) in enumerate(items, 1):
+                    out.write(f">seq_{rank}_count_{cnt}\n")
+                    out.write(seq + "\n")
+
+        def _read_csv_rows(fp: str):
+            with open(fp, "r", newline="") as fh:
+                rdr = csv.DictReader(fh)
+                return rdr.fieldnames, list(rdr)
+
+        def _merge_csv_files(part_files: list[str], target: str):
+            # collect rows and header union
+            all_rows, all_fields = [], OrderedDict()
+            key_candidates = ("pep", "peptide", "dna", "sequence", "seq")
+            for fp in part_files:
+                try:
+                    fields, rows = _read_csv_rows(fp)
+                except Exception as e:
+                    self.logger.warning(f"CSV read failed for {fp}: {e}; skipping.")
+                    continue
+                if not fields:
+                    continue
+                for f in fields:
+                    all_fields.setdefault(f, None)
+                all_rows.extend(rows)
+            if not all_rows:
+                self.logger.warning(f"No CSV rows to merge for {target}")
+                return False
+
+            header = list(all_fields.keys())
+            keycol = next((k for k in key_candidates if k in header), None)
+            if keycol is None:
+                # fallback: concat
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "w", newline="") as outfh:
+                    written = False
+                    for fp in part_files:
+                        with open(fp, "r", newline="") as fh:
+                            first = True
+                            for line in fh:
+                                if first:
+                                    if not written:
+                                        outfh.write(line)
+                                        written = True
+                                    first = False
+                                    continue
+                                outfh.write(line)
+                return True
+
+            # sum counts by normalized sequence key
+            agg = {}
+            for r in all_rows:
+                k = _norm_seq(r.get(keycol, ""))
+                if not k:
+                    continue
+                rec = agg.get(k)
+                if rec is None:
+                    rec = {c: r.get(c, "") for c in header}
+                    # initialize count as float if present
+                    if "count" in header:
+                        try:
+                            rec["count"] = float(rec["count"])
+                        except Exception:
+                            rec["count"] = 0.0
+                    rec[keycol] = k
+                    agg[k] = rec
+                else:
+                    # sum count if present
+                    if "count" in header:
+                        try:
+                            v = r.get("count", "0")
+                            rec["count"] += float(v)
+                        except Exception:
+                            pass
+
+            items = list(agg.values())
+            has_count = "count" in header
+            if has_count:
+                # convert to int when exact & sort
+                for rec in items:
+                    v = rec.get("count", 0.0)
+                    try:
+                        iv = int(v)
+                        rec["count"] = iv if abs(iv - float(v)) < 1e-9 else float(v)
+                    except Exception:
+                        pass
+                items.sort(key=lambda rec: (-float(rec.get("count", 0.0)), rec.get(keycol, "")))
+                if "rank" not in header:
+                    header.append("rank")
+            else:
+                items.sort(key=lambda rec: rec.get(keycol, ""))
+
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", newline="") as outfh:
+                w = csv.DictWriter(outfh, fieldnames=header)
+                w.writeheader()
+                for rank, rec in enumerate(items, 1):
+                    row = {}
+                    for col in header:
+                        if col == "rank" and has_count:
+                            row[col] = rank
+                        elif col == "count" and has_count:
+                            v = rec.get("count", 0.0)
+                            try:
+                                iv = int(v)
+                                row[col] = iv if abs(iv - float(v)) < 1e-9 else float(v)
+                            except Exception:
+                                row[col] = v
+                        else:
+                            row[col] = rec.get(col, "")
+                    w.writerow(row)
+            return True
+
+        def _merge_npy(part_files: list[str], target: str):
+            try:
+                arrays, trailing = [], None
+                for fp in part_files:
+                    arr = np.load(fp, allow_pickle=True)
+                    if trailing is None:
+                        trailing = arr.shape[1:] if arr.ndim >= 1 else ()
+                    elif arr.shape[1:] != trailing:
+                        self.logger.warning(f"Skipping {fp} in NPY merge due to shape mismatch {arr.shape} vs {trailing}")
+                        continue
+                    arrays.append(arr)
+                if not arrays:
+                    self.logger.warning(f"No compatible arrays to merge for {target}")
+                    return False
+                merged = np.concatenate(arrays, axis=0)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                np.save(target, merged, allow_pickle=True)
+                return True
+            except Exception as e:
+                self.logger.error(f"NPY merge failed for {target}: {e}")
+                return False
+
+        # ---------- scan roots for '<base>__chunkN/' groups ----------
+        for root in roots:
+            names = os.listdir(root)
+            # group chunk dirs by base
+            groups = {}
+            for name in names:
+                m = chunk_dir_re.match(name)
+                if not m:
+                    continue
+                base = m.group("base")
+                groups.setdefault((root, base), []).append(os.path.join(root, name))
+
+            if not groups:
+                continue
+
+            for (parent, base), chunk_dirs in groups.items():
+                chunk_dirs = sorted(chunk_dirs)
+                out_dir = os.path.join(parent, base)
+                self.logger.info(f"Merging {len(chunk_dirs)} chunk dir(s) -> {out_dir}/")
+                os.makedirs(out_dir, exist_ok=True)
+
+                # Build relname -> [paths] map by stripping '__chunkN' in file names
+                relmap = {}
+                for cdir in chunk_dirs:
+                    try:
+                        files = os.listdir(cdir)
+                    except Exception as e:
+                        self.logger.warning(f"Cannot list {cdir}: {e}")
+                        continue
+                    for fname in files:
+                        rel = strip_chunk_in_name.sub("", fname)  # e.g., EM_2_merged_pep_count_summary.fasta
+                        relmap.setdefault(rel, []).append(os.path.join(cdir, fname))
+
+                # Merge each relname
+                for rel, part_files in relmap.items():
+                    part_files = sorted(part_files)
+                    target = os.path.join(out_dir, rel)
+                    ext = os.path.splitext(rel)[1].lower()
+                    ok = False
+
+                    if ext in (".fasta", ".fa", ".faa"):
+                        # Sum counts by SEQUENCE, write as '>seq_<rank>_count_<SUM>'
+                        total = defaultdict(int)
+                        try:
+                            for fp in part_files:
+                                for seq, cnt in _read_fasta_counts(fp):
+                                    total[seq] += int(cnt)
+                            _write_merged_fasta(total, target)
+                            ok = True
+                        except Exception as e:
+                            self.logger.error(f"FASTA merge failed for {target}: {e}")
+                            ok = False
+
+                    elif ext == ".csv":
+                        ok = _merge_csv_files(part_files, target)
+
+                    elif ext == ".npy":
+                        ok = _merge_npy(part_files, target)
+
+                    else:
+                        # generic text concat
+                        try:
+                            with open(target, "w") as outfh:
+                                for fp in part_files:
+                                    with open(fp, "r") as fh:
+                                        outfh.write(fh.read())
+                            ok = True
+                        except Exception as e:
+                            self.logger.error(f"Text merge failed for {target}: {e}")
+                            ok = False
+
+                    if ok and delete_chunks:
+                        for fp in part_files:
+                            try:
+                                os.remove(fp)
+                            except Exception as e:
+                                self.logger.warning(f"Could not delete chunk file {fp}: {e}")
+                    self.logger.info("Merge " + ("succeeded" if ok else "failed") + f" for {target}")
+
+                # remove empty chunk dirs
+                if delete_chunks:
+                    for cdir in chunk_dirs:
+                        try:
+                            if not os.listdir(cdir):
+                                os.rmdir(cdir)
+                        except Exception as e:
+                            self.logger.debug(f"Could not remove dir {cdir}: {e}")
+    # --- end merge chunked outputs --------------------------------------------
+
+
+
 class FastqParser(Handler):
     '''
     A processor for fastq/fastq.gz data. Primary parser for the sequencing
@@ -373,13 +778,16 @@ class FastqParser(Handler):
             raise ValueError(f'Sample {sample.name} holds arrays of unsupported dimensionality for {func} op. Expected: arrays of ndims=2, got: ndims={sample.get_ndims()}')
         
         return
-    
+
+    def _decode_q_ascii(self, q_ascii, *, offset:int = 33):
+        return np.frombuffer(q_ascii.encode("ascii"), dtype=np.uint8, count=-1) - offset
+
     def _dna_to_pep(self, seq, force_at_frame=None, stop_readthrough=False):       
              
         def find_orf(seq):
             loc = re.search(self.utr5_seq, seq)
             if loc is not None:
-                return seq[loc.end()-3:]
+                return seq[loc.start():]
             else:
                 return None
         
@@ -538,6 +946,10 @@ class FastqParser(Handler):
                 msg = "5' UTR sequence is not set for the <translation> routine. Can not perform ORF search. Aborting. . ."
                 self.logger.error(msg)
                 raise ValueError(msg)   
+            
+            if isinstance(self.utr5_seq, (list, tuple, set)):
+                # join them with | so re.search() will match any of them
+                self.utr5_seq = "(?:" + ")|(?:".join(self.utr5_seq) + ")"
                 
         if type(stop_readthrough) != bool:
             msg = f'<translate> routine expected to receive param "stop_readthrough" as type=bool; received: {type(stop_readthrough)}'
@@ -554,78 +966,326 @@ class FastqParser(Handler):
                                                      ) 
                                      
                                      for x in sample.D])
-                
+
                 #this transformation is not declared publicly; may be it should
                 sample.transform()
                 self._init_internal_state(sample)
+
                 #set the internal state for the first time, removed for DNA template 
                 #shape = (len(sample), len(self.P_design))
                 #sample._internal_state = np.ones(shape, dtype=np.bool)
 
-                #newly added
-                shape = (len(sample), self._n_templates)
-                sample._internal_state = np.ones(shape, dtype=bool)
             return data
         return translate_dna
     
-    def translate_all_frames(self, stop_readthrough: bool = False):
-    #"""
-    #Translate every read in frames 0,1,2.
-    #The returned Data object contains the *same number of samples*
-    #as the input, but each sample is 3× longer:
-    #    row 0 … N-1   → frame 0 peptides
-    #    row N … 2N-1  → frame 1 peptides
-    #    row 2N … 3N-1 → frame 2 peptides
-    #DNA and Q arrays are vertically repeated to keep alignment.
-    #A new attribute `.frame_id` is appended to each SequencingSample
-    #(0,1,2 per row) for easy downstream inspection.
-    #"""
-        def translate_dna(data):
-            new_samples = []
+    def translate_both_strands(self, *, force_at_frame=None, stop_readthrough=False, utr5_offset: int = 0):
+        """
+        Barcode-gated translation:
+          • Search BARCODE on forward strand.
+              - If found: search UTR5 on forward. If found -> slice from UTR5.end() and translate.
+              - If UTR5 not found -> drop.
+          • Else reverse-complement and search BARCODE on RC.
+              - If found: search UTR5 on RC. If found -> slice from UTR5.end() and translate.
+              - If UTR5 not found -> drop.
+          • If BARCODE not found in either orientation -> drop.
 
+        Outputs one row per kept read. Adds/updates `sample.strand_id` (0=fwd, 1=rc).
+        """
+
+        # ---------------- sanity -------------------------------------------------
+        if force_at_frame is not None and force_at_frame not in (0, 1, 2):
+            raise ValueError("force_at_frame must be 0 / 1 / 2 or None")
+        if not hasattr(self, "utr5_seq"):
+            raise ValueError("5'-UTR regex `utr5_seq` is missing in config")
+        if not hasattr(self, "barcode"):
+            raise ValueError("`barcode` is missing in config")
+        if not isinstance(stop_readthrough, bool):
+            raise TypeError("stop_readthrough must be bool")
+        if not isinstance(utr5_offset, int) or utr5_offset < 0:
+            raise ValueError("utr5_offset must be a non-negative int")
+
+        # ---------------- setup --------------------------------------------------
+        import re
+        import numpy as np
+
+        # Compile UTR (supports str or list/tuple of alternatives)
+        utr5_cfg = getattr(self, "utr5_seq", None)
+        if isinstance(utr5_cfg, (list, tuple)):
+            utr5_re = re.compile("(?:" + "|".join(map(re.escape, utr5_cfg)) + ")")
+        elif isinstance(utr5_cfg, str):
+            utr5_re = re.compile(utr5_cfg)
+        else:
+            raise TypeError("utr5_seq must be str or list/tuple of str")
+
+        # Compile BARCODE (supports str or list/tuple; list treated as literal alts)
+        bc_cfg = getattr(self, "barcode", None)
+        if isinstance(bc_cfg, (list, tuple)):
+            bc_re = re.compile("(?:" + "|".join(map(re.escape, bc_cfg)) + ")")
+        elif isinstance(bc_cfg, str):
+            bc_re = re.compile(bc_cfg)
+        else:
+            raise TypeError("barcode must be str or list/tuple of str")
+
+        def _rc_str(seq: str) -> str:
+            return seq.translate(self.constants.complement_table)[::-1]
+
+        # DNA row -> trimmed string (remove right pad)
+        def _dna_row_to_str(row) -> str:
+            if isinstance(row, np.ndarray):
+                if row.dtype.kind in ("U", "S"):
+                    return "".join(row.tolist()).rstrip(" ")
+                return "".join(map(str, row.tolist())).rstrip(" ")
+            return str(row).rstrip(" ")
+
+        # Trim Q to DNA length
+        def _q_row_trim_to_len(row, L: int):
+            if row is None:
+                return None
+            if isinstance(row, np.ndarray):
+                return row[:L]
+            s = str(row)
+            return s[:L]
+
+        # Slice Q object from index
+        def _q_slice(q_obj, start: int):
+            if q_obj is None:
+                return None
+            try:
+                return q_obj[start:]
+            except Exception:
+                if isinstance(q_obj, (list, tuple)):
+                    return q_obj[start:]
+                return q_obj
+
+        # ---------------- core op ------------------------------------------------
+        def translate_DNA(data):
             for sample in data:
-                # --- build peptide list for all frames -------------------------
-                pep_frames = []
-                for frame in (0, 1, 2):
-                    pep_frames.append([
-                        self._dna_to_pep(dna,
-                                         force_at_frame=frame,
-                                         stop_readthrough=stop_readthrough)
-                        for dna in sample.D
-                    ])
-                P_cat = np.concatenate([np.asarray(x) for x in pep_frames], axis=0)
+                has_Q = hasattr(sample, "Q") and sample.Q is not None
 
-                # --- replicate DNA & Q -----------------------------------------
-                D_cat = np.concatenate([sample.D]*3, axis=0)
-                Q_cat = np.concatenate([sample.Q]*3, axis=0)
+                # Determine iteration count from D (1-D list or 2-D padded)
+                if isinstance(sample.D, np.ndarray) and getattr(sample.D, "ndim", 1) == 2:
+                    N = sample.D.shape[0]
+                else:
+                    N = len(sample.D)
 
-                # --- make a fresh SequencingSample -----------------------------
-                from utils.datatypes import SequencingSample
-                big = SequencingSample(
-                    name = f"{sample.name}_allFrames",
-                    D    = D_cat,
-                    Q    = Q_cat,
-                    P    = P_cat
-                )
-                # who came from which frame?
-                big.frame_id = np.repeat([0,1,2], len(sample))
+                D_out, Q_out, P_out, strand_out = [], [], [], []
 
-                # 1-D → 2-D (pads shorter reads with '')
-                big.transform()
-                
-                # initialise compatibility matrix (all True)
-                big._internal_state = np.ones(
-                    (len(big), len(self.P_design)), dtype=bool)
-                
-                self._init_internal_state(big)
-                
-                new_samples.append(big)
+                for i in range(N):
+                    # Fetch DNA & Q as strings/arrays trimmed to effective length
+                    dna_row = sample.D[i]
+                    dna = _dna_row_to_str(dna_row)
+                    if not dna:
+                        continue
+                    if has_Q:
+                        q_row = sample.Q[i]
+                        q_trim = _q_row_trim_to_len(q_row, len(dna))
+                    else:
+                        q_trim = None
 
+                    # ---------- 1) Forward: barcode -> utr5 ----------
+                    if bc_re.search(dna) is not None:
+                        m_utr = utr5_re.search(dna)
+                        if m_utr is None:
+                            # barcode present but no UTR5 in forward → drop
+                            continue
+                        start_idx = m_utr.start() + utr5_offset         # .start() AT UTR5, change to .end() when start AFTER UTR5
+                        dna_use = dna[start_idx:]
+                        q_use = _q_slice(q_trim, start_idx) if has_Q else None
+                        pep = self._dna_to_pep(
+                            dna_use,
+                            force_at_frame=0,
+                            stop_readthrough=stop_readthrough
+                        )
+                        D_out.append(dna_use)
+                        if has_Q:
+                            Q_out.append(q_use)
+                        P_out.append(pep)
+                        strand_out.append(0)             # forward
+                        continue
+
+                    # ---------- 2) Reverse: barcode (RC) -> utr5 (RC) ----------
+                    dna_rc = _rc_str(dna)
+                    if bc_re.search(dna_rc) is not None:
+                        m_utr_rc = utr5_re.search(dna_rc)
+                        if m_utr_rc is None:
+                            # barcode in RC but no UTR5 in RC → drop
+                            continue
+                        start2 = m_utr_rc.start() + utr5_offset          # '.start()' AT UTR5 in RC, change to .end() when start AFTER UTR5 in RC
+                        if has_Q:
+                            q_rc = q_trim[::-1] if not isinstance(q_trim, np.ndarray) else q_trim[::-1]
+                            q_use = _q_slice(q_rc, start2)
+                        else:
+                            q_use = None
+                        dna_use = dna_rc[start2:]
+                        pep = self._dna_to_pep(
+                            dna_use,
+                            force_at_frame=0,
+                            stop_readthrough=stop_readthrough
+                        )
+                        D_out.append(dna_use)
+                        if has_Q:
+                            Q_out.append(q_use)
+                        P_out.append(pep)
+                        strand_out.append(1)             # reverse-complement
+                        continue
+
+                    # ---------- 3) No barcode in either orientation -> drop ----------
+                    # (do nothing)
+
+                # Assign back as object arrays (ragged-safe) and normalize
+                sample.D = np.asarray(D_out, dtype=object)
+                if has_Q:
+                    sample.Q = np.asarray(Q_out, dtype=object)
+                sample.P = np.asarray(P_out, dtype=object)
+                sample.strand_id = np.asarray(strand_out, dtype=np.int8)
+
+                sample.transform()
+                self._init_internal_state(sample)
+
+            return data
+
+        return translate_DNA
+
+    
+    def translate_all_frames_both_strands(self, stop_readthrough: bool = False):
+        """
+        For every read create SIX peptide sequences:
+
+            ┌─ forward strand ────────────────────────────────┐
+            │  frame 0 , frame 1 , frame 2                    │
+            └──────────────────────────────────────────────────┘
+            ┌─ reverse-complement strand ─────────────────────┐
+            │  frame 0 , frame 1 , frame 2                    │
+            └──────────────────────────────────────────────────┘
+
+        The returned Data object keeps **one sample per input sample**
+        but each sample is 6 × longer.  
+        Extra per-row annotations:
+            • .frame_id   → 0,1,2   (translation frame)
+            • .strand_id  → 0=fwd , 1=rev-comp
+        """
+        # helpers – SAME as in your old revcom()
+        @np.vectorize
+        def _rc(seq: str) -> str:
+            return seq.translate(self.constants.complement_table)[::-1]
+
+        @np.vectorize
+        def _r(seq: str) -> str:
+            return seq[::-1]
+
+        def _make_6x_sample(sample):
+            # -------------------------------------------------------------
+            # 1)  forward-strand peptides (frames 0/1/2) ------------------
+            pep_fwd = []
+            for frame in (0, 1, 2):
+                pep_fwd.append([
+                    self._dna_to_pep(d,
+                                     force_at_frame=frame,
+                                     stop_readthrough=stop_readthrough)
+                    for d in sample.D
+                ])
+            P_fwd = np.concatenate([np.asarray(x) for x in pep_fwd], axis=0)
+            D_fwd = np.concatenate([sample.D] * 3, axis=0)
+            Q_fwd = np.concatenate([sample.Q] * 3, axis=0)
+            frame_fwd  = np.repeat([0, 1, 2], len(sample))
+            strand_fwd = np.zeros(len(P_fwd), dtype=np.int8)          # 0 = forward
+
+            # -------------------------------------------------------------
+            # 2)  reverse-strand peptides (frames 0/1/2) ------------------
+            D_rc  = _rc(sample.D)
+            Q_rc  = _r(sample.Q)
+            pep_rev = []
+            for frame in (0, 1, 2):
+                pep_rev.append([
+                    self._dna_to_pep(d,
+                                     force_at_frame=frame,
+                                     stop_readthrough=stop_readthrough)
+                    for d in D_rc
+                ])
+            P_rev = np.concatenate([np.asarray(x) for x in pep_rev], axis=0)
+            D_rev = np.concatenate([D_rc] * 3, axis=0)
+            Q_rev = np.concatenate([Q_rc] * 3, axis=0)
+            frame_rev  = np.repeat([0, 1, 2], len(sample))
+            strand_rev = np.ones(len(P_rev), dtype=np.int8)           # 1 = reverse
+
+            # -------------------------------------------------------------
+            # 3)  concat forward + reverse -------------------------------
+            P_cat = np.concatenate([P_fwd, P_rev], axis=0)
+            D_cat = np.concatenate([D_fwd, D_rev], axis=0)
+            Q_cat = np.concatenate([Q_fwd, Q_rev], axis=0)
+            frame_id  = np.concatenate([frame_fwd,  frame_rev],  axis=0)
+            strand_id = np.concatenate([strand_fwd, strand_rev], axis=0)
+
+            # build fresh SequencingSample ---------------------------------
+            from utils.datatypes import SequencingSample
+            big = SequencingSample(
+                name=f"{sample.name}_6frames",
+                D=D_cat,
+                Q=Q_cat,
+                P=P_cat
+            )
+            big.frame_id  = frame_id    # 0/1/2
+            big.strand_id = strand_id   # 0=fwd 1=rev
+
+            # 1-D → 2-D (pads with empty '' char)
+            big.transform()
+            self._init_internal_state(big)
+            return big
+
+        # the closure actually executed by Pipeline -----------------------
+        def _translate(data):
+            new_samples = [_make_6x_sample(sample) for sample in data]
             from utils.datatypes import Data
             return Data(samples=new_samples)
 
-        return translate_dna
+        return _translate
     
+    def translate_from_current_D(self, *, force_at_frame: int = 0, stop_readthrough: bool = False):
+        """
+        Recompute peptides from the CURRENT DNA (e.g., after trimming) and replace sample.P.
+        Translation starts at `force_at_frame` (default 0 = first base of current D) and runs to end.
+    """
+        import numpy as np
+        import inspect
+
+        def _row_to_str(row) -> str:
+            # join a 1-char-wide padded row or pass through string/object
+            if isinstance(row, np.ndarray):
+                if row.dtype.kind in ("U", "S"):
+                    return "".join(row.tolist()).rstrip(" ")
+                else:
+                    return "".join(map(str, row.tolist())).rstrip(" ")
+            return str(row).rstrip(" ")
+
+        def _op(data):
+            for sample in data:
+                self._transform_check(sample, inspect.stack()[0][3])
+                # Build peptide list from current DNA rows
+                if hasattr(sample.D, "ndim") and sample.D.ndim == 2:
+                    N = sample.D.shape[0]
+                    peps = [
+                        self._dna_to_pep(_row_to_str(sample.D[i]),
+                                         force_at_frame=force_at_frame,
+                                         stop_readthrough=stop_readthrough)
+                        for i in range(N)
+                    ]
+                else:
+                    peps = [
+                        self._dna_to_pep(_row_to_str(d),
+                                         force_at_frame=force_at_frame,
+                                         stop_readthrough=stop_readthrough)
+                        for d in sample.D
+                    ]
+                sample.P = np.asarray(peps, dtype=object)
+                # normalize representation and internal state
+                sample.transform()
+                self._init_internal_state(sample)
+            return data
+
+        _op.__name__ = "translate_from_current_D"
+        return _op
+
+
     def revcom(self):
         '''
         For each sample in Data, get reverse complement of DNA sequences and 
@@ -643,11 +1303,17 @@ class FastqParser(Handler):
         @np.vectorize
         def _rc(seq):
             return seq.translate(self.constants.complement_table)[::-1]
-
-        @np.vectorize
-        def _r(seq):
-            return seq[::-1]
         
+        def _rev_q_arr(arr):
+            """
+            Reverse each element of the *object-dtype* Q array produced for PacBio.
+            Falls back to the old behaviour for plain strings.
+            """
+            if arr.dtype == object:                   # PacBio / decoded Q
+                return np.array([q[::-1] for q in arr], dtype=object)
+            else:                                     # classic Illumina strings
+                return np.array([q[::-1] for q in arr], dtype=arr.dtype)
+
         def revcom_data(data):
             for sample in data:
     
@@ -661,7 +1327,7 @@ class FastqParser(Handler):
                     self.logger.warning(msg)
                     
                 sample.D = _rc(sample.D)
-                sample.Q = _r(sample.Q)
+                sample.Q = _rev_q_arr(sample.Q)
     
             return data
         return revcom_data
@@ -728,395 +1394,415 @@ class FastqParser(Handler):
             return data
         return length_filter
 
-    def cr_filter(self, where=None, loc=None, tol=1):
-        '''
-        For each sample in Data, filter out sequences not containing intact constant
-        regions. Entries (NGS reads) bearing constant regions with amino acids outside
-    	of the library design specification will be discarded.    
-	
-        Parameters:
-                   where: 'dna' or 'pep' to specify which dataset the op 
-                          should work on.
-						  
-                     loc: a list of ints to specify which constant regions 
-                          the op should process. 
-
-                     tol: int; specifies the maximum allowed number of mutations
-                          constant region fetched with where/loc before the 
-                          entry (NGS read) is discarded. For the library from above
-                          
-                seq:      ACDEF11133211AWVFRTQ12345YTPPK
-             region:      [-0-][---1--][--2--][-3-][-4-]
-        is_variable:      False  True   False True False
-                          
-                          calling cr_filter(where='pep', loc=[2], tol=1), will
-                          discard all sequences containing more than 1 mutation
-                          in the 'AWVFRTQ' region. Note that the insertions/deletions
-                          in the constant region are not validated by the parser.					  
-					 
-        Returns:
-                Transformed Data object containg entries with intact 
-                constant regions
-        '''        
-        self._where_check(where)
-
-        if where == 'pep':
-            design = self.P_design
-        
-        elif where == 'dna':
-            design = self.D_design
-            
-        self._loc_check(loc, design)            
-        if not isinstance(tol, int):
-            msg = f'<constant_region_filter> expected to receive parameter tol as as int; received: {type(tol)}'
-            self.logger.error(msg)  
-            raise ValueError(msg)
-
-        if np.any(design.is_vr[loc]):
-            msg = '<constant_region_filter> expected a list of contant regions to operate on; some of the specified locations point to variable regions.'
-            self.logger.error(msg)
-            raise AssertionError(msg)                
-            
-        def constant_region_filter(data):        
-            from utils.misc import hamming_distance
-            for sample in data:
-                
-                self._transform_check(sample, inspect.stack()[0][3])
-                arr = sample[where]
-                
-                #iterativelt fill in the indexing array
-                for i, template in enumerate(design):
-                    
-                    cr = np.array(template(loc))
-                    cr_mask = template(loc, return_mask=True)
-                    
-                    row_mask = sample._internal_state[:,i]
-                    if np.sum(row_mask) > 0:
-                        dist = hamming_distance(arr[row_mask][:, cr_mask], cr, return_distance=True)
-                        sample._internal_state[row_mask, i] = dist <= tol
-                    else:
-                        continue                    
-
-                #keep every entry that has at least one positive
-                #value in the internal state array
-                ind = np.any(sample._internal_state, axis=-1)
-                sample(ind)
-                    
-            return data
-        return constant_region_filter
-    
-    def cr_filter_fuzzy(self,where: str = "pep",loc: list | None = None,tol: int = 0):
+    def DNA_vote_filter(self, *, templates=None, names=None, k: int = 9,
+                        min_votes: int = 150, annotate: bool = True,
+                        trim_to_template: bool = True):
         """
-        Fuzzy version of cr_filter:
-        Used to filter out sequences with specified constant region while ignoring the length of varible region, 
+        Filter reads by k-mer voting against DNA templates (constant regions only).
+        - templates: list[str or Template-like] or None (auto-discover from D_design)
+        - names: optional list[str]; if None, auto-uses template.name or the template DNA string
+        - k: k-mer size (default 9)
+        - min_votes: keep a read only if max votes across templates >= min_votes
+        - annotate: attach scaffold_id, scaffold_name (if names available), and kmer_votes
+        - trim_to_template: if True, trim D (and Q) to the assigned template span using
+                            the dominant k-mer offset (mode of read_i - tmpl_j).
 
-        Parameters:
-                    loc   – list of constant-region indices (as in LibraryDesign)
-                    tol   – max # point mutations allowed *within* each constant block
-        Returns:
-                    Transformed Data object containg entries with specified constant regions
+        Behavior:
+          * Variable positions in templates (non-ACGT like '1','N', regex tokens) are IGNORED for voting.
+          * Works with 1-D or 2-D padded D/Q/P; output is normalized via transform().
+          * P (peptide) is not altered by trimming.
         """
+        import numpy as np
+        from collections import Counter
 
-    #sanity check
-        self._where_check(where)
-        design = self.P_design if where == "pep" else self.D_design
-        self._loc_check(loc, design)
-        if np.any(design.is_vr[loc]):
-            raise AssertionError("loc must refer to constant regions only.")
-        if not isinstance(tol, int):
-            raise ValueError("tol must be int")
-
-    #pre-compute reference strings for every template
-        ref_blocks = []
-        for tpl in design:
-            block_seq = "".join(tpl(loc))
-            ref_blocks.append(block_seq)
-
-    #helper: Hamming distance
-        def _hd(a: str, b: str) -> int:
-            if len(a) != len(b):                     # safety
-                return abs(len(a) - len(b)) + sum(x!=y for x,y in zip(a,b))
-            return sum(x != y for x, y in zip(a, b))
-
-        def constant_region_fuzzy_filter(data):
-            for sample in data:
-                self._transform_check(sample, inspect.stack()[0][3])
-
-                arr = sample[where]          # 2-D array of shape (N, Lmax)
-                seqs = ["".join(row).rstrip() for row in arr]  # strip pads
-
-            # mark every entry initially False
-                keep = np.zeros(len(arr), dtype=bool)
-
-                for j, tpl in enumerate(design):
-                    if len(sample):          # safety for empty samples
-                        row_mask = sample._internal_state[:, j]
+        # ---------------- helpers ----------------
+        def _coerce_templates_to_str_list(tmpls):
+            out = []
+            for t in tmpls:
+                if isinstance(t, str):
+                    out.append(t)
+                else:
+                    v = getattr(t, "lib_seq", None)
+                    if isinstance(v, str):
+                        out.append(v)
                     else:
-                        row_mask = []
-
-                    ref = ref_blocks[j]
-                    Lref = len(ref)
-
-                    for idx in np.where(row_mask)[0]:
-                        s = seqs[idx]
-                        # slide a window of size Lref across the read
-                        best = Lref+1
-                        for p in range(0, len(s) - Lref + 1):
-                            cand = s[p:p+Lref]
-                            best = min(best, _hd(cand, ref))
-                            if best == 0:
+                        for attr in ("dna", "DNA", "template"):
+                            v2 = getattr(t, attr, None)
+                            if isinstance(v2, str):
+                                out.append(v2)
                                 break
-                        if best <= tol:
-                            keep[idx] = True
+                        else:
+                            out.append(str(t))
+            return [str(x) for x in out]
 
-                # apply filter
-                sample(keep)
-            return data
+        def _autodiscover_templates_and_names():
+            # Prefer config merged into parser
+            for attr in ("D_design", "D_library", "Dlib", "library_design", "lib_design"):
+                obj = getattr(self, attr, None)
+                if obj is not None and hasattr(obj, "templates"):
+                    tmpls = list(obj.templates)
+                    names_local = []
+                    for t in tmpls:
+                        nm = getattr(t, "name", None)
+                        if isinstance(nm, str) and nm:
+                            names_local.append(nm)
+                        else:
+                            nm2 = getattr(t, "lib_seq", None)
+                            names_local.append(nm2 if isinstance(nm2, str) else str(t))
+                    return _coerce_templates_to_str_list(tmpls), names_local
+            # Fallback to loaded config modules
+            import sys
+            for mod in list(sys.modules.values()):
+                try:
+                    PC = getattr(mod, "ParserConfig", None)
+                    if PC is None:
+                        continue
+                    Dlib = getattr(PC, "D_design", None)
+                    if Dlib is None or not hasattr(Dlib, "templates"):
+                        continue
+                    tmpls = list(Dlib.templates)
+                    names_local = []
+                    for t in tmpls:
+                        nm = getattr(t, "name", None)
+                        if isinstance(nm, str) and nm:
+                            names_local.append(nm)
+                        else:
+                            nm2 = getattr(t, "lib_seq", None)
+                            names_local.append(nm2 if isinstance(nm2, str) else str(t))
+                    return _coerce_templates_to_str_list(tmpls), names_local
+                except Exception:
+                    continue
+            raise ValueError("DNA_vote_filter: cannot find D_design.templates; pass templates=[...] explicitly.")
 
-        return constant_region_fuzzy_filter
-    
-    def mask_regions_fuzzy(self, *, where: str= "pep", loc: list| None,mode: str= "cr", tol: int= 0, mask_token: str= "*"):
+        def _constant_mask(tdna: str) -> np.ndarray:
+            arr = np.frombuffer(tdna.upper().encode("ascii"), dtype="S1")
+            return np.isin(arr, np.array([b"A", b"C", b"G", b"T"]))
+
+        def _template_kmers_with_pos(tdna: str, k: int):
+            """
+            Return:
+              kset: set of constant-only kmers
+              kpos: dict kmer -> list of positions (start indices in template)
+            """
+            mask = _constant_mask(tdna)
+            L = len(tdna)
+            kset = set()
+            kpos = {}
+            if L >= k:
+                m = mask.astype(np.uint8)
+                win_ok = (np.convolve(m, np.ones(k, dtype=np.uint8), mode="valid") == k)
+                tdnaU = tdna.upper()
+                for i, ok in enumerate(win_ok):
+                    if ok:
+                        km = tdnaU[i:i+k]
+                        kset.add(km)
+                        kpos.setdefault(km, []).append(i)
+            return kset, kpos
+
+        def _template_kmers(tdna: str, k: int):
+            return _template_kmers_with_pos(tdna, k)[0]
+
+        # ---------------- prepare templates ----------------
+        if templates is None:
+            templates, auto_names = _autodiscover_templates_and_names()
+            if names is None:
+                names = auto_names
+        else:
+            templates = _coerce_templates_to_str_list(list(templates))
+            if names is None:
+                names = templates
+
+        T = len(templates)
+        if T == 0:
+            raise ValueError("DNA_vote_filter: no templates available")
+        if names is not None and len(names) != T:
+            raise ValueError("DNA_vote_filter: names length must match templates")
+
+        t_dnas = templates  # already strings
+        if trim_to_template:
+            # need positions for offset estimation
+            tk = [_template_kmers_with_pos(t, k) for t in t_dnas]
+            t_ksets = [x[0] for x in tk]
+            t_kpos  = [x[1] for x in tk]
+        else:
+            t_ksets = [_template_kmers(t, k) for t in t_dnas]
+            t_kpos  = None
+
+        def _calc_votes(seq: str):
+            # Use all windows from the read; only constant template kmers can match anyway.
+            seqU = seq.upper()
+            Ls = len(seqU)
+            if Ls < k:
+                return np.zeros(T, dtype=np.int32)
+            v = np.zeros(T, dtype=np.int32)
+            for i in range(Ls - k + 1):
+                km = seqU[i:i+k]
+                for t_idx, kset in enumerate(t_ksets):
+                    if km in kset:
+                        v[t_idx] += 1
+            return v
+
+        def _estimate_offset_and_span(seqU: str, t_idx: int) -> tuple[int | None, int | None, int | None, int]:
+            """
+            Estimate alignment offset AND the span of consistent matches in READ coords.
+            Returns (offset, min_i, max_i, support). Only k-mers whose (i - j) equals the
+            mode offset contribute to min_i/max_i. If no matches, returns (None, None, None, 0).
+            """
+            if t_kpos is None:
+                return None, None, None, 0
+            kpos_map = t_kpos[t_idx]
+            Ls = len(seqU)
+            if Ls < k:
+                return None, None, None, 0
+
+            offsets = Counter()
+            # First pass: gather all offsets from any match
+            for i in range(Ls - k + 1):
+                km = seqU[i:i+k]
+                pos_list = kpos_map.get(km)
+                if pos_list:
+                    for j in pos_list:
+                        offsets[i - j] += 1
+
+            if not offsets:
+                return None, None, None, 0
+
+            # Mode offset (break ties by larger support)
+            off, support = max(offsets.items(), key=lambda kv: kv[1])
+
+            # Second pass: compute span using only matches consistent with the mode
+            min_i, max_i = None, None
+            for i in range(Ls - k + 1):
+                km = seqU[i:i+k]
+                pos_list = kpos_map.get(km)
+                if not pos_list:
+                    continue
+                # any template position j giving the mode offset?
+                if any((i - j) == off for j in pos_list):
+                    if min_i is None or i < min_i:
+                        min_i = i
+                    if max_i is None or i > max_i:
+                        max_i = i
+
+            if min_i is None or max_i is None:
+                return None, None, None, 0
+
+            return int(off), int(min_i), int(max_i), int(support)
+
+        def _row_to_string(row):
+            # Convert a row that might be a '<U1' char array, bytes, or string → clean DNA string
+            if isinstance(row, np.ndarray):
+                if row.dtype.kind in ("U", "S"):
+                    return "".join(row.tolist()).rstrip(" ")
+                else:
+                    return "".join(map(str, row.tolist())).rstrip(" ")
+            s = str(row)
+            return s.strip()
+
+        def _slice_q_like(q_src, i_row, start, end):
+            """
+            Slice the Q row i_row from [start:end] and return a 1-D object suitable for transform().
+            Handles 2-D numpy matrices, 1-D numpy arrays, and strings.
+            """
+            if q_src is None:
+                return None
+            if hasattr(q_src, "ndim"):
+                if q_src.ndim == 2:
+                    return q_src[i_row, start:end]
+                elif q_src.ndim == 1:
+                    return q_src[start:end]
+            # object / string list
+            row = q_src[i_row] if isinstance(q_src, (list, tuple, np.ndarray)) else q_src
+            if isinstance(row, np.ndarray):
+                return row[start:end]
+            return str(row)[start:end]
+
+        # ---------------- core op ----------------
+        def DNA_vote_filter(d):
+            for sample in d:
+                # Build list of DNA strings and remember original lengths for default slicing
+                D_is_2d = hasattr(sample.D, "ndim") and sample.D.ndim == 2
+                if D_is_2d:
+                    D_strs = [_row_to_string(r) for r in sample.D]
+                else:
+                    D_strs = [_row_to_string(r) for r in sample.D]
+
+                Q_src = getattr(sample, "Q", None)
+                P_src = getattr(sample, "P", None)
+
+                keep_idx = []
+                assign_ids = []
+                vote_vals = []
+
+                D_out, Q_out = [], []
+                P_out = [] if P_src is not None else None
+                trim_starts, trim_ends = [], []
+
+                for i, seq in enumerate(D_strs):
+                    if not seq:
+                        continue
+
+                    v = _calc_votes(seq)
+                    t_idx = int(np.argmax(v))
+                    vmax = int(v[t_idx])
+                    if vmax < int(min_votes):
+                        continue  # drop
+
+                    # keep this row
+                    keep_idx.append(i)
+                    assign_ids.append(t_idx)
+                    vote_vals.append(vmax)
+
+                    # 2) In the main loop (inside DNA_vote_filter), replace the old trimming block:
+                    if trim_to_template:
+                        # Tail-trim to the last constant-region k-mer hit of the assigned template
+                        seqU = seq.upper()
+                        Ls = len(seqU)
+                        kset = t_ksets[t_idx]  # constant-only kmers for assigned template
+
+                        last_i = -1
+                        if Ls >= k and kset:
+                            # scan once to locate the last hit
+                            for j in range(Ls - k + 1):
+                                if seqU[j:j+k] in kset:
+                                    last_i = j
+
+                        if last_i >= 0:
+                            start = 0                      # 5' already trimmed by translator
+                            end   = last_i + k             # keep through the LAST anchor k-mer
+                        else:
+                            # no anchor found (should be rare if votes >= min_votes): keep as-is
+                            start, end = 0, len(seq)
+
+                        D_out.append(seq[start:end])
+                        if Q_src is not None:
+                            Q_out.append(_slice_q_like(Q_src, i, start, end))
+                        if P_out is not None:
+                            P_i = P_src[i] if hasattr(P_src, "__getitem__") else P_src
+                            if isinstance(P_i, np.ndarray) and P_i.dtype.kind in ("U", "S"):
+                                P_out.append("".join(P_i.tolist()).rstrip(" "))
+                            else:
+                                P_out.append(P_i)
+                        trim_starts.append(start)
+                        trim_ends.append(end)
+                    else:
+                        # No trimming: keep effective sequence string (right pads removed)
+                        D_out.append(seq)
+                        if Q_src is not None:
+                            L = len(seq)
+                            if hasattr(Q_src, "ndim") and getattr(Q_src, "ndim", 1) == 2:
+                                Q_out.append(Q_src[i, :L])
+                            else:
+                                qi = Q_src[i] if hasattr(Q_src, "__getitem__") else Q_src
+                                if isinstance(qi, np.ndarray):
+                                    Q_out.append(qi[:L])
+                                else:
+                                    Q_out.append(str(qi)[:L])
+                        if P_out is not None:
+                            P_i = P_src[i] if hasattr(P_src, "__getitem__") else P_src
+                            if isinstance(P_i, np.ndarray) and P_i.dtype.kind in ("U", "S"):
+                                P_out.append("".join(P_i.tolist()).rstrip(" "))
+                            else:
+                                P_out.append(P_i)
+
+                # Apply to sample: convert to object arrays and re-pad via transform()
+                sample.D = np.asarray(D_out, dtype=object)
+                if Q_src is not None:
+                    sample.Q = np.asarray(Q_out, dtype=object)
+                if P_out is not None:
+                    sample.P = np.asarray(P_out, dtype=object)
+
+                # Annotations
+                if annotate:
+                    sample.scaffold_id = np.asarray(assign_ids, dtype=np.int32)
+                    if names is not None:
+                        sample.scaffold_name = np.asarray([names[i] for i in assign_ids], dtype=object)
+                    sample.kmer_votes = np.asarray(vote_vals, dtype=np.int32)
+                    if trim_to_template:
+                        sample.trim_start = np.asarray(trim_starts, dtype=np.int32)
+                        sample.trim_end   = np.asarray(trim_ends,   dtype=np.int32)
+                        sample.template_len = np.asarray([len(t_dnas[i]) for i in assign_ids], dtype=np.int32)
+
+                # Rebuild padded representation & internal state
+                sample.transform()
+                self._init_internal_state(sample)
+
+            return d
+
+        return DNA_vote_filter
+
+
+    def cr_filter_fuzzy(self, *, where="pep", loc=None, tol=0):
         """
-    Replace residues with `mask_token` even when variable-region length
-    differs from the design.
+        Fuzzy constant-region filter (works with multiple templates).
 
-    Parameters
-    ----------
-    where : {"pep", "dna"}
-        Dataset on which to operate.
-    loc : list[int]
-        Region indices (0-based) coming from LibraryDesign.loc.
-        *For mode="cr"* these must point to **constant** regions.<br>
-        *For mode="vr"* they must point to **variable** regions whose
-        *neighbouring constant blocks* exist in the design.
-    mode : {"cr", "vr"}
-        "cr" → mask the constant blocks themselves  
-        "vr" → mask the variable region *between* its two constant
-               neighbours.
-    tol : int
-        Max substitutions allowed inside a constant block before it is
-        still considered a match (Hamming distance).
-    mask_token : str
-        Character to write over the positions (defaults `"*"`, but `"N"`
-        would make sense for DNA).
+        Parameters
+        ----------
+        where : {"pep", "dna"}
+            Dataset to operate on.
+        loc : list[int]
+            Constant-region indices to check.
+        tol : int
+            Max substitutions allowed inside a constant block.
 
-    Returns
-    -------
-    callable  – suitable for Pipeline.enque()
-    """
-
-    #sanity checks
-        if mode not in ("cr", "vr"):
-            raise ValueError("mode must be 'cr' or 'vr'")
-
+        Returns
+        -------
+        callable   –  ready for Pipeline.enque()
+        """
+        # ------------------------------------------------ sanity ----------
         self._where_check(where)
         design = self.P_design if where == "pep" else self.D_design
         self._loc_check(loc, design)
-
-        # constant / variable consistency
-        if mode == "cr" and np.any(design.is_vr[loc]):
-            raise AssertionError("loc for mode='cr' must point to constant regions.")
-        if mode == "vr" and not np.all(design.is_vr[loc]):
-            raise AssertionError("loc for mode='vr' must point to variable regions.")
-
         if not isinstance(tol, int) or tol < 0:
             raise ValueError("tol must be a non-negative int")
 
-    #helpers
-        def _hamming(a: str, b: str) -> int:
-            """Return Hamming distance between equal-length strings."""
+        # ------------------------------------------------ ref blocks ------
+        anchors = [ {r: "".join(tpl([r])) for r in loc}  # per-template dict
+                    for tpl in design ]
+
+        def _ham(a, b):     # tiny helper
             return sum(x != y for x, y in zip(a, b))
 
-    # reference blocks for every template
-        refs = []
-        for tpl in design:
-            if mode == "cr":
-                refs.append({"".join(tpl([k])) for k in loc})
-            else:                          # mode == 'vr'
-                left_blocks  = {}
-                right_blocks = {}
-                for k in loc:
-                # left constant (if any)
-                    if k > 0 and not design.is_vr[k-1]:
-                        left_blocks[k] = "".join(tpl([k-1]))
-                # right constant (if any)
-                    if k < design.loc.max() and not design.is_vr[k+1]:
-                        right_blocks[k] = "".join(tpl([k+1]))
-                refs.append( (left_blocks, right_blocks) )
+        # ------------------------------------------------ core op ---------
+        def cr_filter_fuzzy(data):
 
-        def mask_fuzzy(data):
             for sample in data:
                 self._transform_check(sample, inspect.stack()[0][3])
-                arr  = sample[where]
-                seqs = ["".join(r).rstrip() for r in arr]
-                bool_mask = np.ones(arr.shape, bool)
 
-                for t_idx, tpl in enumerate(design):
+                arr   = sample[where]
+                seqs  = np.asarray(["".join(row) for row in arr])
 
-                    row_mask = (sample._internal_state[:, t_idx]
-                                if sample._internal_state.ndim else
-                                np.ones(len(arr), bool))
+                # NB: DO NOT collapse – we want all template columns intact
 
-                    if mode == "cr":
-                        for ridx in np.where(row_mask)[0]:
-                            s = seqs[ridx]
-                            for block in refs[t_idx]:
-                                L = len(block)
-                                for p in range(len(s)-L+1):
-                                    if _hamming(s[p:p+L], block) <= tol:
-                                        bool_mask[ridx, p:p+L] = False
-                                        break
+                for tpl_idx, tpl in enumerate(design):
 
-                    else:
-                        left_map, right_map = refs[t_idx]
+                    ref_blocks = anchors[tpl_idx]
 
-                        for ridx in np.where(row_mask)[0]:
-                            s = seqs[ridx]
+                    # evaluate ALL rows for this template --------------
+                    keep_vec = np.zeros(len(seqs), dtype=bool)
 
-                            for k in loc:
-                                p_left = 0
-                                if k in left_map:
-                                    Lc   = len(left_map[k])
-                                    best = Lc + 1
-                                    for p in range(len(s)-Lc+1):
-                                        d = _hamming(s[p:p+Lc], left_map[k])
-                                        if d < best:
-                                            best, p_left = d, p
-                                            if best == 0:
-                                                break
-                                    if best > tol:
-                                        continue
-                                    p_var_start = p_left + Lc
-                                else:
-                                    p_var_start = 0
+                    for ridx, seq in enumerate(seqs):
+                        ok = True
+                        for block in ref_blocks.values():
+                            L = len(block)
+                            hit = False
+                            for p in range(len(seq) - L + 1):
+                                if _ham(seq[p:p+L], block) <= tol:
+                                    hit = True
+                                    break
+                            if not hit:
+                                ok = False
+                                break
+                        keep_vec[ridx] = ok
 
-                                p_var_end = len(s)
-                                if k in right_map:
-                                    Rc   = len(right_map[k])
-                                    best = Rc + 1
-                                    p_right = -1
-                                    for p in range(p_var_start, len(s)-Rc+1):
-                                        d = _hamming(s[p:p+Rc], right_map[k])
-                                        if d < best:
-                                            best, p_right = d, p
-                                            if best == 0:
-                                                break
-                                    if best > tol:
-                                        continue
-                                    p_var_end = p_right
+                    # combine with previous state (logical AND) --------
+                    sample._internal_state[:, tpl_idx] &= keep_vec
 
-                                if p_var_end > p_var_start:
-                                    bool_mask[ridx, p_var_start:p_var_end] = False
-
-                arr[~bool_mask] = mask_token
-                sample[where] = arr
+                # drop reads that failed for *every* template ----------
+                sample(np.any(sample._internal_state, axis=1))
             return data
 
-        return mask_fuzzy
-
-    def vr_filter(self, where=None, loc=None, sets=None):
-        '''
-        For each sample in Data, filter out sequences not containing intact variable 
-        regions. Entries (NGS reads) bearing variable regions with amino acids outside
-    	of the library design specification will be discarded.
-    
-        Parameters:
-                   where: 'dna' or 'pep' to specify which dataset the op 
-                          should work on.
-						  
-                     loc: a list of ints to specify which variable regions 
-                          the op should process. 
-
-                    sets: a list of ints; a list of monomer subsets to
-                          check. For the library from above
-                          
-                seq:      ACDEF11133211AWVFRTQ12345YTPPK
-             region:      [-0-][---1--][--2--][-3-][-4-]
-        is_variable:      False  True   False True False
-                          
-                          there are five distinct variable amino acids:
-                          1, 2, 3, 4, 5. The config file specifies which specific
-                          amino acids are allowed for each of these numbers.
-                          <vr_filter> op will make sure that each variable position
-                          contains only the "allowed" monomers.					
-
-                          vr_filter(where='pep', loc=[1], sets=[1, 3]) will make
-                          sure that in region loc=1, variable amino acids 1 and 3
-                          match the specification; variable amino acid 2 will not
-                          be checked against in this example. Passing loc=[2] to
-                          <vr_filter> op will raise an error, because it isn't a
-                          variable region.
-					 
-        Returns:
-                Transformed Data object containg entries with intact 
-                variable regions
-        '''
-        self._where_check(where)
-        if where == 'pep':
-            design = self.P_design
-        
-        elif where == 'dna':
-            design = self.D_design
-        
-        self._loc_check(loc, design)
-        if not isinstance(sets, list):
-            msg = f'variable_region_filter routine expected to receive a list of monomer subsets to parse; received: {type(sets)}'
-            self.logger.error(msg)
-            raise ValueError(msg)            
-
-        allowed = set(design.monomers.keys())
-        passed = set(sets)
-        if not passed.issubset(allowed):
-            msg = 'Specified variable region sets for <variable_region_filter> routine must constitute a subset of library design monomers.'
-            self.logger.error(msg)
-            raise AssertionError(msg)
-
-        if not np.all(design.is_vr[loc]):
-            msg = '<variable_region_filter> expected a list of variable regions to operate on; some of the specified locations point to constant regions.'
-            self.logger.error(msg)
-            raise AssertionError(msg)
-            
-        def variable_region_filter(data):                     
-            for sample in data:
-                self._transform_check(sample, inspect.stack()[0][3])
-                arr = sample[where]
-
-                #first things first: temporarily expand the internal
-                #state array by one dimension; will collapse back at the end
-                sample._internal_state = np.repeat(sample._internal_state[:,:,np.newaxis], len(sets), axis=-1)
-                
-                for i, template in enumerate(design): 
-                    
-                    #use internal state to figure out which
-                    #entries are worth focusing on
-                    row_mask = sample._internal_state[:,i,0]
-                  
-                    for j,subset in enumerate(sets):
-                        
-                        #work out column-wise mask
-                        col_mask = np.array(template(loc, return_mask=True))
-                        col_mask = col_mask[np.array(template(loc)) == subset]
-                                      
-                        #get the matching array: check whether entries are all in the corresponding monomer subset
-                        match = np.in1d(arr[row_mask][:,col_mask], design.monomers[subset])
-                        
-                        #np.in1d flattens the array, so it needs to be reshaped back
-                        match = match.reshape(arr[row_mask][:,col_mask].shape)
-                                     
-                        #the entry is taken only if everything matches
-                        sample._internal_state[row_mask, i, j] = np.all(match, axis=1)
-               
-                #reduce along the subset axis to return
-                #internal state array in its original form
-                sample._internal_state = np.all(sample._internal_state, axis=-1)
-                
-                #keep every entry that has at least one positive
-                #value in the internal state array
-                ind = np.any(sample._internal_state, axis=-1)
-                sample(ind)
-                
-            return data
-        return variable_region_filter
+        return cr_filter_fuzzy
 
     def filt_ambiguous(self, where=None):
         '''
@@ -1183,49 +1869,296 @@ class FastqParser(Handler):
             return data
         return drop_dataset
 
-    def q_score_filt(self, minQ=None, loc=None):
-        '''
-        For each sample in Data, filter out sequences associated with Q scores below 
-        the specified threshold minQ.
-    
-        Parameters:
-                     loc: a list of ints to specify which regions 
-                          the op should process. 
+    def q_score_report(self, minQ: int | None = None, per_read_limit: int = 20,
+                       basewise: bool = False, show_dna: bool = False,
+                       dna_max_len: int = 300, dna_wrap: int = 0):
+        """
+        Print Q-score diagnostics to the terminal (logger):
+          • Normalizes Q to numeric Phred.
+          • Ignores padding columns (spaces/zeros), checks only real bases.
+          • Logs global stats and per-read summaries (first `per_read_limit` reads).
+          • If `minQ` is given (e.g., 75), uses numeric Phred; if data are numeric and
+            minQ looks ASCII-like (>60), automatically interprets as minQ-33.
+          • If `show_dna=True`, also logs the DNA sequence under review (unpadded).
+        """
+        import numpy as np
+        import inspect
 
-                    minQ: every Q score in the regions specified 
-                          by loc should be greater or equal than 
-						  this value; everything else will be discarded
-                        						  
-						  
-        Returns:
-                Transformed Data object
-        '''
-        
-        if not isinstance(minQ, int):
-            msg = f'<Q_score_filter> routine expected to receive parameter minQ as as int; received: {type(minQ)}'
-            self.logger.error(msg)  
-            raise ValueError(msg)
+        def _to_phred_numeric(q2d: np.ndarray) -> np.ndarray:
+            if not hasattr(q2d, "ndim") or q2d.ndim != 2:
+                raise ValueError("q_score_report expects sample.Q as 2-D matrix after transform()")
+            kind = q2d.dtype.kind
+            if kind in ("u", "i", "f"):
+                qmin = int(np.nanmin(q2d)) if q2d.size else 0
+                qmax = int(np.nanmax(q2d)) if q2d.size else 0
+                if 33 <= qmin <= 126 and 33 <= qmax <= 126:  # ASCII codes -> Phred
+                    return (q2d.astype(np.int16) - 33)
+                return q2d.astype(np.int16)
+            if kind in ("U", "S"):
+                to_ord = np.frompyfunc(lambda ch: ord(ch) - 33, 1, 1)
+                return to_ord(q2d).astype(np.int16)
+            out = np.empty(q2d.shape, dtype=np.int16)
+            it = np.nditer(q2d, flags=["multi_index", "refs_ok"], op_flags=["readonly"])
+            while not it.finished:
+                v = it[0].item()
+                if isinstance(v, (int, float, np.integer, np.floating)):
+                    ival = int(v)
+                    out[it.multi_index] = ival - 33 if (33 <= ival <= 126) else ival
+                else:
+                    s = str(v)
+                    out[it.multi_index] = (ord(s[0]) - 33) if s else 0
+                it.iternext()
+            return out
 
-        self._loc_check(loc, self.D_design)
-        def q_score_filter(data):
-            
+        def _valid_base_mask(D2d: np.ndarray) -> np.ndarray:
+            # True where D contains a real base; handles char and numeric ASCII.
+            kind = D2d.dtype.kind
+            if kind in ("U", "S"):
+                return (D2d != " ") & (D2d != "")
+            if kind in ("u", "i"):
+                v = D2d
+                upper = (v >= 65) & (v <= 90)     # 'A'..'Z'
+                lower = (v >= 97) & (v <= 122)    # 'a'..'z'
+                return upper | lower
+            return (D2d.astype("U") != " ")
+
+        def _row_dna_string(D2d: np.ndarray, row_idx: int, valid_row_mask: np.ndarray) -> str:
+            """Return unpadded DNA string for row_idx restricted to valid bases."""
+            row = D2d[row_idx]
+            if D2d.dtype.kind in ("U", "S"):
+                vals = row[valid_row_mask]
+                return "".join(vals.tolist())
+            if D2d.dtype.kind in ("u", "i"):
+                vals = row[valid_row_mask]
+                try:
+                    return "".join(chr(int(x)) for x in vals)
+                except Exception:
+                    return "".join(str(int(x)) for x in vals)
+            # fallback
+            vals = row[valid_row_mask].astype("U")
+            return "".join(vals.tolist())
+
+        def _wrap(s: str, w: int) -> str:
+            if not w or w <= 0:
+                return s
+            return "\n".join(s[i:i+w] for i in range(0, len(s), w))
+
+        def _op(data):
             for sample in data:
                 self._transform_check(sample, inspect.stack()[0][3])
-                arr = sample.Q                          
-                for i, template in enumerate(self.D_design):
-                    
-                    row_mask = sample._internal_state[:,i]
-                    col_mask = template(loc, return_mask=True)
+                D, Q = sample.D, sample.Q
+                vb = _valid_base_mask(D)
+                q = _to_phred_numeric(Q)
 
-                    sample._internal_state[row_mask, i] = np.all(arr[row_mask][:,col_mask] >= minQ, axis=1)
-        
-                #keep every entry that has at least one positive
-                #value in the internal state array
-                ind = np.any(sample._internal_state, axis=-1)
-                sample(ind)
-            
+                flat = q[vb]
+                if flat.size == 0:
+                    self.logger.info("[q_score_report] no valid bases in this sample.")
+                    continue
+
+                gmin = int(flat.min())
+                gmed = float(np.median(flat))
+                gmean = float(flat.mean())
+                g95 = float(np.quantile(flat, 0.95))
+                self.logger.info(f"[q_score_report] bases={flat.size}, rows={D.shape[0]}, "
+                                 f"global Phred: min={gmin}, median={gmed:.1f}, mean={gmean:.1f}, p95={g95:.1f}")
+
+                thr = None
+                if minQ is not None:
+                    thr = int(minQ)
+                    if thr > 60 and flat.max() <= 60:
+                        self.logger.info(f"[q_score_report] Interpreting minQ={minQ} as ASCII; using {minQ-33} on numeric Phred.")
+                        thr = minQ - 33
+                    frac_bases = float((flat >= thr).sum()) / flat.size
+                    # per-read fractions
+                    lens = vb.sum(axis=1)
+                    pr_frac = []
+                    reads_all = 0
+                    for r in range(D.shape[0]):
+                        if lens[r] == 0:
+                            continue
+                        vals = q[r, vb[r]]
+                        ok = (vals >= thr)
+                        pr_frac.append(ok.mean())
+                        if ok.all():
+                            reads_all += 1
+                    pr_frac = np.array(pr_frac) if pr_frac else np.array([0.0])
+                    p50, p90, p95, p99 = np.quantile(pr_frac, [0.5, 0.9, 0.95, 0.99])
+                    self.logger.info(f"[q_score_report] threshold={thr} (numeric Phred); "
+                                     f"bases>=thr={frac_bases*100:.1f}%; "
+                                     f"reads all>=thr={reads_all}/{(lens>0).sum()}; "
+                                     f"per-read frac>=thr: 50%={p50:.2f}, 90%={p90:.2f}, 95%={p95:.2f}, 99%={p99:.2f}")
+
+                # Per-read details (first per_read_limit)
+                limit = min(int(per_read_limit), D.shape[0])
+                lens = vb.sum(axis=1)
+                for i in range(limit):
+                    if lens[i] == 0:
+                        continue
+                    vals = q[i, vb[i]]
+                    mu = float(vals.mean())
+                    mn = int(vals.min())
+                    p5 = float(np.quantile(vals, 0.05))
+                    p95i = float(np.quantile(vals, 0.95))
+                    if thr is None:
+                        self.logger.info(f"[q_score_report] read#{i}: len={int(lens[i])}, "
+                                         f"mean={mu:.1f}, min={mn}, p5={p5:.1f}, p95={p95i:.1f}")
+                    else:
+                        frac_ok = float((vals >= thr).mean())
+                        self.logger.info(f"[q_score_report] read#{i}: len={int(lens[i])}, "
+                                         f"mean={mu:.1f}, min={mn}, p5={p5:.1f}, p95={p95i:.1f}, "
+                                         f"frac>=thr={frac_ok:.2f}")
+
+                    if show_dna:
+                        seq = _row_dna_string(D, i, vb[i])
+                        seq_len = len(seq)
+                        if seq_len > dna_max_len > 0:
+                            disp = seq[:dna_max_len] + f"... (total {seq_len} nt)"
+                        else:
+                            disp = seq
+                        disp = _wrap(disp, dna_wrap)
+                        self.logger.info(f"[q_score_report] read#{i} DNA ({seq_len} nt):\n{disp}")
+
+                    if basewise:
+                        # show up to 1000 base-wise values to avoid spam
+                        L_show = min(1000, vals.size)
+                        preview = " ".join(str(int(x)) for x in vals[:L_show])
+                        self.logger.info(f"[q_score_report] read#{i} first {L_show} Q: {preview}")
+
             return data
+
+        _op.__name__ = "q_score_report"
+        return _op
+
+
+
+    def q_score_filt(self, minQ: int, loc: list[int] | None = None, frac: float = 1.0):
+        """
+        Filter reads by per-base quality (numeric Phred after normalization).
+        - Normalize Q exactly once based on valid (non-pad) bases.
+        - Ignores padding columns in D (spaces OR zeros); only real bases are checked.
+        - If minQ looks like ASCII (e.g., 75) and data are numeric, uses (minQ - 33).
+        """
+        import numpy as np
+        import inspect
+
+        if not isinstance(minQ, int):
+            raise ValueError("<q_score_filt> expects minQ as int")
+
+        use_full_read = (loc is None) or (loc == "all")
+        if not use_full_read:
+            self._loc_check(loc, self.D_design)
+
+     # ---- helpers ---------------------------------------------------------
+        def _to_ascii_codes(q2d: np.ndarray) -> np.ndarray:
+            """
+            Return a numeric matrix of ASCII codes (33..126) if Q is char-like,
+            or the original numeric values if Q is already numeric. NO -33 HERE.
+            """
+            if not hasattr(q2d, "ndim") or q2d.ndim != 2:
+                raise ValueError("q_score_filt expects sample.Q as 2-D matrix after transform()")
+            kind = q2d.dtype.kind
+            if kind in ("u", "i", "f"):
+                return q2d.astype(np.int16)                     # keep numbers as-is
+            if kind in ("U", "S"):
+                to_ord = np.frompyfunc(lambda ch: ord(ch) if ch else 0, 1, 1)
+                return to_ord(q2d).astype(np.int16)            # ASCII codes
+            # object / mixed: numbers stay; strings → ord(char)
+            out = np.empty(q2d.shape, dtype=np.int16)
+            it = np.nditer(q2d, flags=["multi_index", "refs_ok"], op_flags=["readonly"])
+            while not it.finished:
+                v = it[0].item()
+                if isinstance(v, (int, float, np.integer, np.floating)):
+                    out[it.multi_index] = int(v)
+                else:
+                    s = str(v)
+                    out[it.multi_index] = (ord(s[0]) if s else 0)
+                it.iternext()
+            return out
+
+        def _valid_base_mask(D2d: np.ndarray) -> np.ndarray:
+            """
+            True where D contains a real base (A/C/G/T/N/letters).
+            Handles char matrices (U/S) and numeric (ASCII code) with zero/space padding.
+            """
+            kind = D2d.dtype.kind
+            if kind in ("U", "S"):
+                return (D2d != " ") & (D2d != "")
+            if kind in ("u", "i"):
+                v = D2d
+                upper = (v >= 65) & (v <= 90)    # 'A'..'Z'
+                lower = (v >= 97) & (v <= 122)   # 'a'..'z'
+                return upper | lower
+            return (D2d.astype("U") != " ")
+
+        def q_score_filter(data):
+            for sample in data:
+                # Ensure transformed 2-D matrices
+                self._transform_check(sample, inspect.stack()[0][3])
+
+                D = sample.D
+                Q = sample.Q
+
+                vb_all = _valid_base_mask(D)          # 2-D boolean: real bases only
+
+                # Step 1: get a numeric matrix (ASCII codes if chars; raw if numeric)
+                q_raw = _to_ascii_codes(Q)
+
+                # Step 2: normalize ONCE to numeric Phred using ONLY valid cells
+                flat_raw_valid = q_raw[vb_all]
+                if flat_raw_valid.size and 33 <= int(flat_raw_valid.min()) <= 126 and 33 <= int(flat_raw_valid.max()) <= 126:
+                    # Looks like ASCII-coded qualities → convert to Phred
+                    q_phred = (q_raw - 33).astype(np.int16)
+                else:
+                    # Already numeric Phred (or something else outside ASCII range)
+                    q_phred = q_raw.astype(np.int16)
+
+                # Step 3: threshold (ASCII→numeric) decision also from valid cells
+                flat = q_phred[vb_all]
+                thr = int(minQ)
+                if thr > 60 and flat.size and int(flat.max()) <= 60:
+                    self.logger.info(f"[q_score_filt] Interpreting minQ={minQ} as ASCII; using {minQ-33} on numeric Phred.")
+                    thr = minQ - 33
+
+                # Per-template decisions, intersecting with vb_all (and optional loc mask)
+                for i, template in enumerate(self.D_design):
+                    row_mask = sample._internal_state[:, i]
+                    rows = np.where(row_mask)[0]
+                    if rows.size == 0:
+                        continue
+
+                    tmask = None if use_full_read else template(loc, return_mask=True)  # 1-D across columns
+                    keep_vec = np.zeros(rows.size, dtype=bool)
+
+                    for idx, r in enumerate(rows):
+                        vb = vb_all[r]                       # valid columns for this row
+                        if tmask is None:
+                            eff = vb
+                        else:
+                            L = min(vb.shape[0], tmask.shape[0])
+                            eff = vb[:L] & tmask[:L]
+
+                        cols = np.nonzero(eff)[0]
+                        if cols.size == 0:
+                            keep_vec[idx] = False
+                            continue
+
+                        qvals = q_phred[r, cols]
+                        if frac >= 1.0:
+                            keep_vec[idx] = bool(np.all(qvals >= thr))
+                        else:
+                            need = int(np.ceil(qvals.size * float(frac)))
+                            keep_vec[idx] = int(np.sum(qvals >= thr)) >= need
+
+                    sample._internal_state[row_mask, i] = keep_vec
+
+                # Drop reads rejected for all templates
+                sample(np.any(sample._internal_state, axis=-1))
+            return data
+
         return q_score_filter
+
+
+
 
     def fetch_at(self, where=None, loc=None):
         '''
@@ -1283,10 +2216,8 @@ class FastqParser(Handler):
             return data
         return fetch_region
     
-    def fetch_at_fuzzy(self, *, where: str = "pep", loc: list[int],
-                   tol:   int      = 0,        # substitutions tolerated in each constant block
-                   pad:   str      = "",       # what to pad shorter reads with
-                   keep_design:    bool = True):
+    def fetch_at_fuzzy(self, *, where: str = "pep", loc: list[int], tol: int = 0,
+                       pad: str = "", keep_design: bool = True):
         """
         Fuzzy version of fetch_at:
           • works even when the variable regions (VRs) are longer / shorter
@@ -1317,105 +2248,100 @@ class FastqParser(Handler):
         -------
         callable  – ready to `pip.enque()`
         """
-        #sanity checks
         self._where_check(where)
         design = self.P_design if where == "pep" else self.D_design
         self._loc_check(loc, design)
-
-        if not isinstance(tol, int) or tol < 0:
+        if tol < 0 or not isinstance(tol, int):
             raise ValueError("tol must be a non-negative int")
 
-        #helper
         def _ham(a: str, b: str) -> int:
-            return sum(x != y for x, y in zip(a, b))              # Hamming
+            return sum(x != y for x, y in zip(a, b))
 
-        # Pre-extract reference blocks for every template
-        anchors = []   # list[tpl_idx] → dict{reg_idx: str} for constant regs
+        refs = []
+        n_regions = design.loc.max() + 1
+        anchors = []
         for tpl in design:
-            a = {}
-            for r in range(len(tpl.region)):
-                if not design.is_vr[r]:
-                    a[r] = "".join(tpl([r]))          # constant block
-            anchors.append(a)
+            anchors.append({i: "".join(tpl([i])) 
+                            for i in range(n_regions)
+                            if not design.is_vr[i]}) 
 
         def fetch_fuzzy(data):
             for sample in data:
                 self._transform_check(sample, inspect.stack()[0][3])
-
                 if not sample._is_collapsed:
-                    msg = (f"<fetch_at_fuzzy> will collapse sample "
-                           f"{sample.name}'s internal state")
-                    self.logger.info(msg)
                     sample._collapse_internal_state()
 
-                arr      = sample[where]                       # 2-D ndarray
-                seq_strs = ["".join(row).rstrip(pad) for row in arr]
+                arr   = sample[where]
+                seqs  = ["".join(r).rstrip(pad) for r in arr]
+                out_snippets = []
+                max_len = 0
 
-                # first scan to find all snippets, remembering max len
-                snippets  = []                                 # parallel to seqs
-                max_len   = 0
-                for ridx, seq in enumerate(seq_strs):
+        # ------------------------------------------------------------------
+        # iterate read-by-read
+        # ------------------------------------------------------------------
+                for ridx, seq in enumerate(seqs):
+                    flags = sample._internal_state[ridx, :len(design)]
+                    if not np.any(flags):               # nothing matched → keep empty
+                        out_snippets.append("")
+                        continue
 
-                    # which template does this read belong to?
-                    tpl_idx = sample._internal_state[ridx].argmax()
-                    tpl_anchor = anchors[tpl_idx]
+                    tpl_idx = flags.argmax()            # library template that matched
+                    anchor  = anchors[tpl_idx]
 
-                    segs = []          # pieces we keep for that read
+                    piece, pos = [], 0                  # ← moving cursor
 
+            # go through the requested blocks *in order*
                     for r in loc:
                         if design.is_vr[r]:
-                            left_end = 0
-                            if r-1 in tpl_anchor:              # has left CR
-                                ref = tpl_anchor[r-1]; Lc = len(ref)
-                                best, pos = Lc+1, -1
-                                for p in range(len(seq)-Lc+1):
-                                    d = _ham(seq[p:p+Lc], ref)
-                                    if d < best:
-                                        best, pos = d, p
-                                        if best == 0: break
-                                if best > tol: continue        # no anchor → skip
-                                left_end = pos + Lc
-                            right_start = len(seq)
-                            if r+1 in tpl_anchor:              # has right CR
-                                ref = tpl_anchor[r+1]; Rc = len(ref)
-                                best, pos = Rc+1, -1
-                                for p in range(left_end, len(seq)-Rc+1):
-                                    d = _ham(seq[p:p+Rc], ref)
-                                    if d < best:
-                                        best, pos = d, p
-                                        if best == 0: break
-                                if best > tol: continue
-                                right_start = pos
-                            segs.append(seq[left_end:right_start])
+                            if (r+1) not in anchor:
+                                continue
+                    # left boundary is current cursor -----------------------
+                            left = pos
 
-                        else:
-                            # constant region – find first fuzzy match
-                            ref = tpl_anchor[r]; Lc = len(ref)
-                            best, pos = Lc+1, -1
-                            for p in range(len(seq)-Lc+1):
-                                d = _ham(seq[p:p+Lc], ref)
-                                if d < best:
-                                    best, pos = d, p
-                                    if best == 0: break
-                            if best > tol: continue
-                            segs.append(seq[pos:pos+Lc])
+                    # try finding the right-hand anchor (CR r+1) ------------
+                            right = None
+                            if (r + 1) in anchor:
+                                refR = anchor[r + 1]
+                                Lr   = len(refR)
+                                for p in range(left, len(seq) - Lr + 1):
+                                    if _ham(seq[p:p+Lr], refR) <= tol:
+                                        right = p
+                                        break
 
-                    new = "".join(segs)
-                    snippets.append(new)
-                    max_len = max(max_len, len(new))
+                    # no right anchor? – cut at read end --------------------
+                            if right is None:
+                                continue
 
-                # build rectangular ndarray and overwrite sample[where]
-                new_arr = np.full((len(snippets), max_len), pad,
-                                  dtype=arr.dtype)
-                for i, s in enumerate(snippets):
-                    new_arr[i, :len(s)] = list(s)
-                sample[where] = new_arr
+                            piece.append(seq[left:right])
+                            pos = right                      # advance the cursor
+
+                        else:                               # constant region
+                            ref = anchor[r]; Lc = len(ref)
+                            found = False                   # search *after* the cursor
+                            for p in range(pos, len(seq) - Lc + 1):
+                                if _ham(seq[p:p+Lc], ref) <= tol:
+                                    piece.append(seq[p:p+Lc])
+                                    pos   = p + Lc
+                                    found = True
+                                    break
+                            if not found:
+                                # skip the block if the anchor cannot be located
+                                continue
+
+                    frag = "".join(piece)
+                    max_len = max(max_len, len(frag))
+                    out_snippets.append(frag)
+
+        # build a padded ndarray -------------------------------------------
+                out = np.full((len(out_snippets), max_len), pad, dtype=arr.dtype)
+                for i, frag in enumerate(out_snippets):
+                    out[i, :len(frag)] = list(frag)
+
+                sample[where] = out
 
             if not keep_design:
                 design.truncate_and_reindex(loc)
-
             return data
-
         return fetch_fuzzy
 
     def unpad(self):
@@ -1994,9 +2920,14 @@ class FastqParser(Handler):
             DNA = content[1::4]
             DNA = np.array([x.rstrip('\n') for x in DNA])
             
-            Q = content[3::4]
-            Q = np.array([x.rstrip('\n') for x in Q])
-            
+            Q_ascii = content[3::4] 
+            Q_ascii = [x.rstrip('\n') for x in Q_ascii]
+            min_char = min(min(map(ord, s)) for s in Q_ascii)
+            offset   = 33 if min_char < 59 else 64           # auto-detect
+            Q        = np.array(
+                [self._decode_q_ascii(s, offset=offset) for s in Q_ascii],
+                dtype=object,
+            )
             f.close()
         
         sample = SequencingSample(
@@ -2007,6 +2938,80 @@ class FastqParser(Handler):
                                  )
         return sample
  
+    
+
+    def stream_chunks_from_gz_dir(self, *, chunk_lines: int = 4_000_000, chunk_bytes: int | None = None):
+        """
+        A generator factory that yields Data objects chunk-by-chunk from all .fastq.gz files
+        in the configured sequencing_data directory. Each yielded Data contains one SequencingSample
+        named "<basename>__chunk<N>".
+        Limits:
+          - chunk_lines: max number of text lines per chunk (must be multiple of 4).
+          - chunk_bytes: optional total byte cap per chunk across lines; if set, closes chunk
+            when either lines or bytes threshold is exceeded.
+        """
+        if chunk_lines % 4 != 0:
+            msg = f"<stream_chunks_from_gz_dir> chunk_lines must be multiple of 4; received: {chunk_lines}"
+            self.logger.error(msg); raise ValueError(msg)
+
+        fnames = [os.path.join(self.dirs.seq_data, x) for x in os.listdir(self.dirs.seq_data) if x.endswith(".fastq.gz")]
+        if not fnames:
+            msg = f'No .fastq.gz files were found in {self.dirs.seq_data}! Aborting.'
+            self.logger.error(msg)
+            raise IOError(msg)
+
+        PHRED_OFFSET = 33
+        def _make_sample(name, seqs, quals):
+            # to 2D arrays
+            import numpy as _np
+            if not seqs:
+                return SequencingSample(D=_np.empty((0,1), dtype='<U1'),
+                                        Q=_np.empty((0,1), dtype=_np.uint8), P=None, name=name)
+            maxL = max(len(s) for s in seqs)
+            D = _np.full((len(seqs), maxL), '', dtype='<U1')
+            for i, s in enumerate(seqs):
+                D[i, :len(s)] = list(s)
+            maxLq = max(len(q) for q in quals) if quals else 0
+            Q = _np.zeros((len(quals), maxLq), dtype=_np.uint8)
+            for i, q in enumerate(quals):
+                qv = _np.asarray(q, dtype=_np.uint8)
+                Q[i, :len(qv)] = qv
+            return SequencingSample(D=D, Q=Q, P=None, name=name)
+
+        def _iter():
+            import gzip as _gzip
+            for f in fnames:
+                base = os.path.splitext(os.path.splitext(os.path.basename(f))[0])[0]
+                with _gzip.open(f, 'rt') as fh:
+                    buf_seq, buf_q = [], []
+                    line_no = 0
+                    chunk_id = 0
+                    acc_bytes = 0
+                    cur_seq, cur_q = None, None
+                    for line in fh:
+                        line_no += 1
+                        acc_bytes += len(line.encode('utf-8', 'ignore'))
+                        k = line_no % 4
+                        if k == 2:
+                            cur_seq = line.strip()
+                        elif k == 0:
+                            cur_q = line.strip()
+                            buf_seq.append(cur_seq)
+                            buf_q.append([ord(c) - PHRED_OFFSET for c in cur_q])
+                            cur_seq, cur_q = None, None
+                        # emit chunk if thresholds reached
+                        if (line_no % chunk_lines == 0) or (chunk_bytes is not None and acc_bytes >= chunk_bytes):
+                            chunk_id += 1
+                            sample = _make_sample(f"{base}__chunk{chunk_id}", buf_seq, buf_q)
+                            yield Data(samples=[sample])
+                            buf_seq, buf_q = [], []
+                            acc_bytes = 0
+                    # tail
+                    if buf_seq:
+                        chunk_id += 1
+                        sample = _make_sample(f"{base}__chunk{chunk_id}", buf_seq, buf_q)
+                        yield Data(samples=[sample])
+        return _iter
     def stream_from_fastq_dir(self, *args):
         '''
         A generator that yields data from self.fastq_dir sample by sample.
@@ -2136,3 +3141,4 @@ class FastqParser(Handler):
                 
             return data
         return save_data    
+    
