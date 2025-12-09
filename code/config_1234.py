@@ -92,13 +92,13 @@ class ParserConfig:
 class TrackerConfig:
     
     #directory holding sequencing data files (fastq or fastq.gz)
-    seq_data = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20251105/Input_fastq'
+    seq_data = '/PATH/TO/INPUT_FASTQ/FOLDER'
         
     #directory for writing logs to
-    logs = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20251105/logs'
+    logs = '/PATH/TO/RUN_LOG'
     
     #directory that stores fastqparser outputs
-    parser_out = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20251105/parser_outputs'
+    parser_out = '/PATH/TO/OUTPUT/FOLDER'
 
 class LoggerConfig:
     
@@ -113,6 +113,3 @@ class LoggerConfig:
     
     #log filename; when None, the name will be inferred by the Logger itself
     log_fname = os.path.join(TrackerConfig.logs, experiment + ' logs')    
-
-    #nohup python3 yeast_analysis_chunk.py -c yeast_config.py >1.log &
-    #nohup bash -c 'naiveFL_analysis_chunk.py -c naiveFL_config_1.py > 1.log 2>&1 && python3 naiveFL_analysis_chunk.py -c naiveFL_config_2A.py > naiveFL_analysis_revcom.log 2>&1' &
