@@ -143,28 +143,31 @@ class SequencingSample:
             self._is_collapsed = True
         return
 
-    def transform_P(self, pad=None):
-        '''
-        An exposed method to transform 1D arrays into 2D.
-        Upon transformation, ndarray's dtype is transformed
-        to '<U1'. If 1D array contains sequences of unequal
-        length, padding is necessary. If 'pad' is not specified, 
-        the resulting 2D array will be padded with empty strings ('').
-        '''
-        
-        if self.P.ndim == 1:
-            shape = (self.P.size, max([len(x) for x in self.P]))
-            P2d = np.zeros(shape, dtype='<U1')
-            
-            if pad is not None:
-                P2d.fill(pad)
-            
-            for i, pep in enumerate(self.P):
-                P2d[i,:len(pep)] = list(pep) 
-        
-            self.P = P2d
-            
-        return                
+    def transform_P(self, pad: str | None = None):
+        """
+        Convert the 1-D peptide list (dtype=object) to a 2-D, right-padded
+        char matrix (dtype='<U1').
+
+        If `pad` is None the array is padded with the empty string ``""``.
+        """
+        if self.P.ndim != 1:          # already 2-D → nothing to do
+            return
+
+        if pad is None:               # default padding token
+            pad = ""
+
+        max_len = max(len(p) for p in self.P)
+
+        # --- SAFE allocation ------------------------------------------------
+        # np.full initialises every cell with `pad`, so no garbage from
+        # previous rows can leak into shorter peptides.
+        P2d = np.full((len(self.P), max_len), pad, dtype="<U1")
+
+        for i, pep in enumerate(self.P):
+            P2d[i, :len(pep)] = list(pep)
+
+        self.P = P2d
+       
 
     def transform_D(self, pad=None):
         '''
@@ -189,34 +192,38 @@ class SequencingSample:
             
         return 
 
-    def transform_Q(self, pad=None):
-        '''
-        An exposed method to transform 1D arrays into 2D.
-        Upon transformation, ndarray's dtype is transformed
-        to int16. If 1D array contains sequences of unequal
-        length, padding is necessary. If 'pad' is not specified, 
-        the resulting 2D array will be padded with empty strings ('').
-        
-        Converts Q datasets to numerical representations stored
-        as 2D ndarrays.
-        '''
-        
-        def ord_mapper(x):
-            return [ord(a) - 33 for a in list(x)]
-        
-        if self.Q.ndim == 1:
-            shape = (self.Q.size, max([len(x) for x in self.Q]))
-            Q2d = np.zeros(shape, dtype=np.int16)
-            
-            if pad is not None:
-                Q2d.fill(pad)
-            
-            for i, read in enumerate(self.Q):
-                Q2d[i,:len(read)] = ord_mapper(read) 
-        
-            self.Q = Q2d
-            
-        return 
+    def transform_Q(self, pad: int | None = 0):
+        """
+        Build the 2-D Q-score matrix.
+
+        Accepts:
+          • Illumina ASCII strings   → ord(char)-33
+          • numeric Phred arrays     → copied as-is
+        """
+        # ------------------------------------------------------------------
+        if pad is None:                          # ← NEW ────────────────┐
+            pad = 0                              #                       │
+        # ------------------------------------------------------------------┘
+
+        Q1d = self.Q
+        if len(Q1d) == 0:                        # nothing to do
+            return
+
+        max_len = max(len(r) for r in Q1d)
+        Q2d     = np.full((len(Q1d), max_len), pad, dtype=np.uint8)
+
+        for i, read in enumerate(Q1d):
+
+            # TEXT mode ----------------------------------------------------
+            if isinstance(read, (str, bytes)):
+                Q2d[i, :len(read)] = [ord(c) - 33 for c in read]
+
+            # NUMERIC mode -------------------------------------------------
+            else:
+                Q2d[i, :len(read)] = np.asarray(read, dtype=np.uint8)
+
+        self.Q = Q2d
+
 
     def transform(self, pad=None):
         '''
