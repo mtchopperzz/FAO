@@ -1,7 +1,7 @@
 import os
 from utils.lib_design import LibraryDesign
 
-experiment = '1234_VH_test'
+experiment = 'Specifica_naiveFL_test'
 
 class constants:
     '''
@@ -46,8 +46,11 @@ class constants:
     aa_dict = {aa: i for i,aa in enumerate(aas)}
           
 class ParserConfig:
-
-    utr5_seq = 'AGGAGAT......ATG'    
+    barcode = [
+               'CGCTTACATTCACGCCCT'
+            ]
+    
+    utr5_seq = ['GGTGGAGGAGGCTCT']
     #DNA library design
     #"1" is used to refer random monomers. the number of 1, in another word the length of variable region, does not need to be exact when calling _fuzzy operations
     #therefore, 111 can be any non-constant region sequence with any length
@@ -57,8 +60,7 @@ class ParserConfig:
     D_design = LibraryDesign(
         
                     templates=[
-                                '111ACCGTCGATATGAAAATTACCTCTCCGACCACTGAGGACACTGCGACGTACTTCTGTGCGCGT111TGGGGTCCGGGTACTTTGGTTACCGTCTCCTCC111',
-                                '111ACCGTCGATATGAAAATTACCTCTCCGACCACTGAGGACACTGCGACGTACTTCTGTGCGCGT111TGGGGTCCGGGTACTTTGGTTACCGTCTCCTCC111',
+                                '111ATCG111',
                               ],
             
                     monomers={
@@ -73,8 +75,9 @@ class ParserConfig:
     P_design = LibraryDesign(
         
                     templates=[
-                                '1121ACDEFG111111111111HIKL1111',
-                              ],
+                                'GGGGS111TVSS111',
+                                'GGGGS111TVSA111',
+                            ],
             
                     monomers={
                               1: ('A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y'),
@@ -89,13 +92,13 @@ class ParserConfig:
 class TrackerConfig:
     
     #directory holding sequencing data files (fastq or fastq.gz)
-    seq_data = '../4685/GZ'
+    seq_data = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20251105/Input_fastq'
         
     #directory for writing logs to
-    logs = '../logs'
+    logs = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20251105/logs'
     
     #directory that stores fastqparser outputs
-    parser_out = '../parser_outputs/revcom-2'
+    parser_out = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20251105/parser_outputs'
 
 class LoggerConfig:
     
@@ -110,3 +113,6 @@ class LoggerConfig:
     
     #log filename; when None, the name will be inferred by the Logger itself
     log_fname = os.path.join(TrackerConfig.logs, experiment + ' logs')    
+
+    #nohup python3 yeast_analysis_chunk.py -c yeast_config.py >1.log &
+    #nohup bash -c 'naiveFL_analysis_chunk.py -c naiveFL_config_1.py > 1.log 2>&1 && python3 naiveFL_analysis_chunk.py -c naiveFL_config_2A.py > naiveFL_analysis_revcom.log 2>&1' &
