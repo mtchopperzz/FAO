@@ -1564,44 +1564,195 @@ class EnrichmentAnalyzer:
         self.logger.info(f"Saved convergence plots for {base_name}")
 
     def auto_discover_and_analyze(self, region_specs, epsilon=1e-5, power=1.0, retention_power=1.0):
-        """
-        Scans parser_out for files named <LIB>_<R#>_pep_counts_annotated.csv.
-        Groups them by <LIB>, sorts rounds, and runs analysis.
-        """
         self.logger.info("Scanning for multi-round libraries...")
-        
-        # 1. Find all annotated files
-        pattern = os.path.join(self.root, "**", "*_pep_counts_annotated.csv")
-        files = glob.glob(pattern, recursive=True)
-        
-        if not files:
-            self.logger.warning("No annotated CSV files found.")
+
+        def _get_parser_root():
+            for attr in (
+                "parser_out",
+                "parser_output",
+                "parser_output_dir",
+                "root_dir",
+                "root",
+                "output_dir",
+                "out_dir",
+                "base_dir",
+                "data_dir",
+            ):
+                value = getattr(self, attr, None)
+                if isinstance(value, str) and value:
+                    return value
+            return "."
+
+        def _clean_sample_stem(file_path):
+            stem = os.path.splitext(os.path.basename(file_path))[0]
+
+            changed = True
+            while changed:
+                changed = False
+                for suffix in ("_annotated", "_pep_counts"):
+                    if stem.endswith(suffix):
+                        stem = stem[: -len(suffix)]
+                        changed = True
+
+            return stem
+
+        def _parse_round(sample_stem):
+            m = re.search(
+                r"(?:^|__)round-?R?(\d+)(?=__|_|$)",
+                sample_stem,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                return int(m.group(1))
+
+            m = re.search(
+                r"(?:^|_)R(\d+)(?=__|_|$)",
+                sample_stem,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                return int(m.group(1))
+
+            return None
+
+        def _parse_condition(sample_stem):
+            if re.search(
+                r"(?:^|__)cond-neg(?:ative)?(?=__|_|$)",
+                sample_stem,
+                flags=re.IGNORECASE,
+            ):
+                return "neg"
+
+            if re.search(
+                r"(?:^|__)cond-input(?=__|_|$)",
+                sample_stem,
+                flags=re.IGNORECASE,
+            ):
+                return "input"
+
+            if re.search(
+                r"(?:^|__)cond-pos(?:itive)?(?=__|_|$)",
+                sample_stem,
+                flags=re.IGNORECASE,
+            ):
+                return "pos"
+
+            if _parse_round(sample_stem) is not None:
+                return "pos"
+
+            return "unknown"
+
+        def _library_key(sample_stem):
+            parts = sample_stem.split("__")
+            kept = []
+
+            for part in parts:
+                p = part.strip()
+                if not p:
+                    continue
+
+                p = re.sub(r"_R\d+(?=_|$)", "", p, flags=re.IGNORECASE)
+                p = re.sub(r"^R\d+$", "", p, flags=re.IGNORECASE)
+
+                if re.match(r"^round-?R?\d+$", p, flags=re.IGNORECASE):
+                    continue
+                if re.match(r"^cond-", p, flags=re.IGNORECASE):
+                    continue
+                if re.match(r"^negtype-", p, flags=re.IGNORECASE):
+                    continue
+                if re.match(r"^rep-", p, flags=re.IGNORECASE):
+                    continue
+
+                if p:
+                    kept.append(p)
+
+            return "__".join(kept) if kept else sample_stem
+
+        def _round_sort_key(round_key):
+            return int(str(round_key).lstrip("Rr"))
+
+        parser_root = _get_parser_root()
+
+        annotated_files = glob.glob(
+            os.path.join(parser_root, "**", "*_annotated.csv"),
+            recursive=True,
+        )
+        annotated_files = list(dict.fromkeys(annotated_files))
+
+        self.logger.info(f"Found {len(annotated_files)} annotated CSV files under: {parser_root}")
+
+        discovered_libraries = {}
+
+        for file_path in annotated_files:
+            sample_stem = _clean_sample_stem(file_path)
+            round_num = _parse_round(sample_stem)
+            condition = _parse_condition(sample_stem)
+            lib_key = _library_key(sample_stem)
+
+            self.logger.info(
+                "Round discovery candidate | "
+                f"sample='{sample_stem}' | "
+                f"condition='{condition}' | "
+                f"round='{round_num}' | "
+                f"library_key='{lib_key}'"
+            )
+
+            if condition != "pos":
+                self.logger.info(f"Skipping non-positive sample for enrichment: {sample_stem}")
+                continue
+
+            if round_num is None:
+                self.logger.warning(f"Could not parse round number from annotated file: {sample_stem}")
+                continue
+
+            round_key = f"R{round_num}"
+
+            if lib_key not in discovered_libraries:
+                discovered_libraries[lib_key] = {}
+
+            if round_key in discovered_libraries[lib_key]:
+                old_path = discovered_libraries[lib_key][round_key]
+                self.logger.warning(
+                    f"Duplicate positive round detected for library '{lib_key}', {round_key}. "
+                    f"Old file: {old_path} | New file: {file_path}. Keeping the later file."
+                )
+
+            discovered_libraries[lib_key][round_key] = file_path
+
+        if not discovered_libraries:
+            self.logger.warning(
+                "No positive round files matched either the old <LIB>_R# pattern "
+                "or the new FAO2 __round-R#__cond-pos pattern."
+            )
             return
 
-        # 2. Group by Library Name
-        regex = re.compile(r"^(.*)_(R\d+)_pep_counts_annotated\.csv$")
-        
-        lib_groups = {} 
-        
-        for fpath in files:
-            fname = os.path.basename(fpath)
-            match = regex.match(fname)
-            if match:
-                lib_name = match.group(1)
-                round_id = match.group(2)
-                
-                if lib_name not in lib_groups:
-                    lib_groups[lib_name] = {}
-                lib_groups[lib_name][round_id] = fpath
-        
-        if not lib_groups:
-            self.logger.warning("No files matched the <LIB>_<R#> pattern.")
+        libraries = {}
+
+        for lib_key, round_map in discovered_libraries.items():
+            round_map = dict(sorted(round_map.items(), key=lambda x: _round_sort_key(x[0])))
+            detected = ", ".join(round_map.keys())
+
+            if len(round_map) < 2:
+                self.logger.warning(
+                    f"Skipping library with fewer than 2 positive rounds: "
+                    f"{lib_key} | rounds: {detected}"
+                )
+                continue
+
+            libraries[lib_key] = round_map
+            self.logger.info(f"Detected multi-round library: {lib_key} | rounds: {detected}")
+
+        if not libraries:
+            self.logger.warning(
+                "Annotated files were found, but no library had at least two positive rounds. "
+                "Enrichment analysis requires at least two positive rounds per library."
+            )
             return
 
         # 3. Process each Library
-        for lib, rounds_dict in lib_groups.items():
+        for lib, rounds_dict in libraries.items():
             # Sort rounds naturally: R1, R2, R10
-            sorted_rounds = sorted(rounds_dict.keys(), key=lambda x: int(x[1:]))
+            sorted_rounds = sorted(rounds_dict.keys(), key=lambda x: int(str(x).lstrip("Rr")))
             
             if len(sorted_rounds) < 2:
                 self.logger.info(f"Skipping {lib}: Found {len(sorted_rounds)} rounds (Need >= 2).")
@@ -1611,17 +1762,6 @@ class EnrichmentAnalyzer:
             self._analyze_single_group(lib, sorted_rounds, rounds_dict, region_specs, epsilon, power, retention_power)
 
     def _analyze_single_group(self, library_name, sorted_rounds, file_map, region_specs, epsilon, power, retention_power):
-        """
-        Calculates enrichment scores for a single library group.
-        
-        Scoring Formula:
-        Score = Ratio(Final_Round) * Retention_Factor^p1 * Enrichment^p2
-        
-        This formula balances:
-        1. Abundance: Clone must be present in significant numbers in the final round.
-        2. Retention: Clone should not have "crashed" (peaked early and disappeared).
-        3. Enrichment: Clone should have increased in frequency from start to finish.
-        """
         # 1. Load DataFrames
         round_dfs = {}
         for r in sorted_rounds:

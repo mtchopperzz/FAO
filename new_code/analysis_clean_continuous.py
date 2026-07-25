@@ -9,12 +9,10 @@ import multiprocessing
 from utils.ProcessHandlers import Pipeline, FastqParser, EnrichmentAnalyzer
 from utils.ProcessHandlers import Logger, DirectoryTracker
 from utils.ContinuousIgblastExtractor import ContinuousIgblastExtractor
-from fao2.prioritizer import run_prioritization
 
-SEQ_DATA_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input'
-LOGS_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input/logs'
-PARSER_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input/parser_outputs'
-PRIORITIZATION_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input/prioritization_outputs/'
+SEQ_DATA_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260427/input'
+LOGS_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260427/logs'
+PARSER_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260427/parser_outputs'
 DELETE_INTERMEDIATE_CHUNKS = True
 
 
@@ -42,8 +40,8 @@ class Config:
         linker_tol_ratio = 0.1
         extract_regions = ['CDR3', 'CDRs', 'FL']
 
-        igblast_ncpu = 64
-        anarci_ncpu = 64
+        igblast_ncpu = multiprocessing.cpu_count()
+        anarci_ncpu = max(1, multiprocessing.cpu_count() - 1)
         anarci_batch_size = 5000
         frame_rescue_offsets = (0, 1, 2)
         anarci_allowed_species = None
@@ -69,27 +67,7 @@ class Config:
         ]
         enrichment_power = 2.0
         retention_power = 1.0
-    class PrioritizationConfig:
-        enabled = True
-        output_dir = PRIORITIZATION_OUT_PATH
 
-        llm_clusters = None
-
-        region_specs = [
-            'H_CDR3_PEP',
-            'H_CDRs_PEP-L_CDRs_PEP',
-            'H_FL_PEP-L_FL_PEP'
-        ]
-
-        write_annotated_uid = True
-
-        strict_topology = True
-
-        split_by_library = True
-
-        write_global_table = None
-
-        library_key_filter = "CD161_8B_yeast__lib-scFv"
 
 class LocalDispatcher:
     def __init__(self, config_obj):
@@ -135,7 +113,7 @@ class LocalDispatcher:
                     'linker_tol_ratio': getattr(p_conf, 'linker_tol_ratio', 0.1),
                     'extract_regions': getattr(p_conf, 'extract_regions', ['FL', 'CDR3', 'CDRs']),
                     'igblast_ncpu': getattr(p_conf, 'igblast_ncpu', multiprocessing.cpu_count()),
-                    'anarci_ncpu': getattr(p_conf, 'anarci_ncpu', max(1, multiprocessing.cpu_count() - 16)),
+                    'anarci_ncpu': getattr(p_conf, 'anarci_ncpu', max(1, multiprocessing.cpu_count() - 1)),
                     'anarci_batch_size': getattr(p_conf, 'anarci_batch_size', 5000),
                     'frame_rescue_offsets': getattr(p_conf, 'frame_rescue_offsets', (0, 1, 2)),
                     'anarci_allowed_species': getattr(p_conf, 'anarci_allowed_species', None),
@@ -156,7 +134,7 @@ if __name__ == '__main__':
     pip, par, ig_extractor, enricher = dispatcher.dispatch_handlers(
         (Pipeline, FastqParser, ContinuousIgblastExtractor, EnrichmentAnalyzer)
     )
-    
+
     pip.enque([
         par.len_filter(where='dna', len_range=Config.FilterConfig.len_range),
         par.q_score_filt(
@@ -187,31 +165,12 @@ if __name__ == '__main__':
             f_path,
             region_specs=Config.AnalysisConfig.visualization_specs,
         )
-    
+
     print('Starting Automatic Enrichment Analysis...')
     enricher.auto_discover_and_analyze(
         region_specs=Config.AnalysisConfig.enrichment_specs,
         power=Config.AnalysisConfig.enrichment_power,
         retention_power=Config.AnalysisConfig.retention_power,
     )
-    """
-    # --- PHASE 5: Candidate Prioritization ---
-    if Config.PrioritizationConfig.enabled:
-        print('Starting Candidate Prioritization...')
 
-        prioritization_outputs = run_prioritization(
-            parser_out=Config.TrackerConfig.parser_out,
-            output_dir=Config.PrioritizationConfig.output_dir,
-            llm_clusters=Config.PrioritizationConfig.llm_clusters,
-            region_specs=Config.PrioritizationConfig.region_specs,
-            write_annotated_uid=Config.PrioritizationConfig.write_annotated_uid,
-            strict_topology=Config.PrioritizationConfig.strict_topology,
-            split_by_library=Config.PrioritizationConfig.split_by_library,
-            write_global_table=Config.PrioritizationConfig.write_global_table,
-            library_key_filter=Config.PrioritizationConfig.library_key_filter,
-        )
-    
-        for output_name, output_path in prioritization_outputs.items():
-            print(f'  {output_name}: {output_path}')
-    """
     print('Pipeline Complete.')
