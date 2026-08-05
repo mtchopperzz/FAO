@@ -30,7 +30,7 @@ except ImportError:
     run_anarci = None
     ANARCI_AVAILABLE = False
 
-from utils.ProcessHandlers import IgblastExtractor, _nb_dna_to_pep
+from utils.ProcessHandlers import IgblastExtractor, _nb_dna_to_pep, _nb_revcom
 
 
 
@@ -86,6 +86,39 @@ class ContinuousIgblastExtractor(IgblastExtractor):
             return None
 
     @staticmethod
+    def _parse_airr_boolean(value: Any) -> bool:
+        """Parse AIRR boolean fields such as T/F, True/False, or 1/0."""
+        if value is None:
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        return str(value).strip().lower() in {"t", "true", "1", "yes", "y"}
+
+    @staticmethod
+    def _reverse_complement(dna: str) -> str:
+        """Return the reverse complement of an uppercase DNA string."""
+        dna = str(dna).upper().replace(" ", "")
+        if not dna:
+            return ""
+        arr = np.frombuffer(dna.encode("ascii"), dtype=np.uint8)
+        return _nb_revcom(arr).tobytes().decode("ascii")
+
+    @classmethod
+    def _oriented_query_sequence(cls, hit: pd.Series) -> str:
+        """Return AIRR ``sequence`` in the orientation used by AIRR coordinates."""
+        sequence = str(hit.get("sequence", "")).upper().replace(" ", "")
+        if not sequence or sequence == "NAN":
+            return ""
+        if cls._parse_airr_boolean(hit.get("rev_comp")):
+            sequence = cls._reverse_complement(sequence)
+        return sequence
+
+    @staticmethod
     def _translate(dna: str) -> str:
         dna = str(dna).upper().replace(" ", "")
         usable = len(dna) - (len(dna) % 3)
@@ -131,8 +164,8 @@ class ContinuousIgblastExtractor(IgblastExtractor):
         candidate_id: str,
         frame_offset: int,
     ) -> Optional[Dict[str, Any]]:
-        raw_seq = str(hit.get("sequence", "")).upper().replace(" ", "")
-        if not raw_seq or raw_seq == "NAN":
+        raw_seq = self._oriented_query_sequence(hit)
+        if not raw_seq:
             return None
 
         expected_chain = self._expected_chain(hit)
