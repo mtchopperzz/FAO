@@ -1,41 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-uid.py
-======
+Stable full-length antibody sequence UID utilities.
 
-Small utilities for assigning stable full-length sequence IDs.
+The UID is determined only by the normalized VH and VL amino-acid sequences.
+Library, target, round, condition, count, germline and annotation metadata are
+not included.
 
-Design decision
----------------
-seq_uid is assigned ONLY to a complete full-length candidate identity:
+Canonical order:
+    VH <unit-separator> VL
 
-    H_FL:<H_FL_PEP>|L_FL:<L_FL_PEP>
-
-For VHH libraries, L_FL_PEP is intentionally empty:
-
-    H_FL:<H_FL_PEP>|L_FL:
-
-No UID is assigned to H_CDR3 or CDR-combination layers.  Region-level tables use
-representative_seq_uid to point back to a full-length representative sequence.
+For VHH, VL is an empty string.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import re
 from typing import Any, Mapping
 
 import pandas as pd
 
+
 EMPTY_LIKE = {"", "nan", "none", "null", "na", "n/a", "<na>", "pd.na"}
+STANDARD_AA = frozenset("ACDEFGHIKLMNPQRSTVWY")
+_SEQUENCE_SEPARATOR = "\x1f"
 
 
 def clean_str(value: Any) -> str:
-    """Normalize missing-looking values to an empty string.
-
-    Pandas may represent an empty light chain as NaN/None/<NA>.  UID generation
-    must treat all of these identically, otherwise the same VHH sequence may
-    receive multiple IDs.
-    """
+    """Normalize missing-looking values to an empty string."""
     if value is None:
         return ""
     try:
@@ -43,53 +36,76 @@ def clean_str(value: Any) -> str:
             return ""
     except Exception:
         pass
+
     text = str(value).strip()
     if text.lower() in EMPTY_LIKE:
         return ""
     return text
 
 
+def normalize_variable_peptide(value: Any) -> str:
+    """
+    Normalize a VH/VL amino-acid sequence for UID generation.
+
+    Only whitespace and letter case are normalized. A sequence containing a
+    non-standard residue is rejected by returning an empty string.
+    """
+    sequence = re.sub(r"\s+", "", clean_str(value)).upper()
+    if not sequence:
+        return ""
+    if any(residue not in STANDARD_AA for residue in sequence):
+        return ""
+    return sequence
+
+
 def make_seq_uid(
-    h_fl: Any,
-    l_fl: Any = "",
+    vh: Any,
+    vl: Any = "",
     *,
     prefix: str = "SEQ",
-    digest_len: int = 12,
+    digest_bytes: int = 16,
 ) -> str:
-    """Return a deterministic UID for a full-length H/L amino acid sequence.
-
-    The function itself only requires H_FL to be non-empty.  Topology filtering
-    for scFv/VHH is handled by :func:`make_seq_uid_from_row` because it requires
-    library_type metadata.
     """
-    h = clean_str(h_fl)
-    l = clean_str(l_fl)
-    if not h:
+    Generate a deterministic UID from VH and VL amino-acid sequences only.
+
+    SHA-256 is calculated over the canonical VH/VL payload. The first 16 bytes
+    provide a 128-bit identifier, represented by 22 Base64url characters.
+
+    VHH:
+        VH=<sequence>, VL=""
+    """
+    vh_sequence = normalize_variable_peptide(vh)
+    vl_raw = clean_str(vl)
+    vl_sequence = normalize_variable_peptide(vl_raw) if vl_raw else ""
+
+    if not vh_sequence:
         return ""
-    key = f"H_FL:{h}|L_FL:{l}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:digest_len].upper()
-    return f"{prefix}_{digest}"
+    if vl_raw and not vl_sequence:
+        return ""
+
+    payload = f"{vh_sequence}{_SEQUENCE_SEPARATOR}{vl_sequence}".encode("ascii")
+    digest = hashlib.sha256(payload).digest()[:digest_bytes]
+    token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"{prefix}_{token}"
 
 
-def is_topology_valid(h_fl: Any, l_fl: Any, library_type: str = "unknown") -> bool:
-    """Check whether a row has a valid FL topology for UID assignment.
+def is_topology_valid(vh: Any, vl: Any, library_type: str = "unknown") -> bool:
+    """Validate scFv/VHH topology before UID assignment."""
+    vh_sequence = normalize_variable_peptide(vh)
+    vl_raw = clean_str(vl)
+    vl_sequence = normalize_variable_peptide(vl_raw) if vl_raw else ""
+    library = clean_str(library_type).lower()
 
-    Rules agreed for FAO2 demo:
-      - scFv requires both H_FL and L_FL.
-      - VHH requires H_FL; L_FL is allowed to be empty.
-      - unknown library type falls back to H_FL-only validity.
-    """
-    h = clean_str(h_fl)
-    l = clean_str(l_fl)
-    lib = clean_str(library_type).lower()
-    if not h:
+    if not vh_sequence:
         return False
-    if lib in {"scfv", "scfv-like", "paired", "paired_hl", "fab"}:
-        return bool(l)
-    if lib in {"vhh", "vh", "vh_only", "nanobody", "sdab"}:
+    if vl_raw and not vl_sequence:
+        return False
+
+    if library in {"scfv", "scfv-like", "paired", "paired_hl", "fab"}:
+        return bool(vl_sequence)
+    if library in {"vhh", "vh", "vh_only", "nanobody", "sdab"}:
         return True
-    # Conservative fallback: if library type cannot be parsed, still generate
-    # a UID when H_FL exists; downstream code can filter if needed.
+
     return True
 
 
@@ -101,17 +117,21 @@ def make_seq_uid_from_row(
     library_type: str = "unknown",
     strict_topology: bool = True,
     prefix: str = "SEQ",
-    digest_len: int = 12,
+    digest_bytes: int = 16,
 ) -> str:
-    """Generate seq_uid from a pandas row-like object.
+    """Generate seq_uid from a pandas row-like object."""
+    vh = row.get(h_col, "")
+    vl = row.get(l_col, "")
 
-    If strict_topology is True, invalid scFv H-only/L-only rows get an empty UID.
-    """
-    h = row.get(h_col, "")
-    l = row.get(l_col, "")
-    if strict_topology and not is_topology_valid(h, l, library_type):
+    if strict_topology and not is_topology_valid(vh, vl, library_type):
         return ""
-    return make_seq_uid(h, l, prefix=prefix, digest_len=digest_len)
+
+    return make_seq_uid(
+        vh,
+        vl,
+        prefix=prefix,
+        digest_bytes=digest_bytes,
+    )
 
 
 def append_seq_uid_column(
@@ -123,17 +143,19 @@ def append_seq_uid_column(
     seq_uid_col: str = "seq_uid",
     strict_topology: bool = True,
 ) -> pd.DataFrame:
-    """Return a copy of df with seq_uid appended as the final column.
+    """
+    Return a copy with seq_uid as the final column.
 
-    Existing columns are not altered.  If seq_uid already exists, it is replaced
-    and moved to the end so the parser output remains visually stable.
+    Existing parser columns are not modified.
     """
     out = df.copy()
+
     if h_col not in out.columns:
         out[seq_uid_col] = ""
     else:
         if l_col not in out.columns:
             out[l_col] = ""
+
         out[seq_uid_col] = out.apply(
             lambda row: make_seq_uid_from_row(
                 row,
@@ -144,5 +166,6 @@ def append_seq_uid_column(
             ),
             axis=1,
         )
-    cols = [c for c in out.columns if c != seq_uid_col] + [seq_uid_col]
-    return out[cols]
+
+    columns = [column for column in out.columns if column != seq_uid_col]
+    return out[columns + [seq_uid_col]]

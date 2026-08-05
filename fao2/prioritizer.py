@@ -1,42 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-prioritizer.py
-==============
+FAO2 per-library candidate prioritization.
 
-FAO2 post-processing module.
-
-This file is designed to replace ``fao2/prioritizer.py``.
-Compared with the previous demo version, this version does NOT load all
-annotated.csv files into one global dataframe before splitting by library.
-It first builds sample metadata, groups samples by library_key, and then reads
-only one library's annotated.csv files at a time.
-
-Inputs
-------
-- Existing FAO parser outputs: parser_outputs/**/**_annotated.csv
-- Optional LLM clustering CSV/XLSX
-
-Outputs
--------
-- prioritization_outputs/sample_metadata.csv
-- prioritization_outputs/library_manifest.csv
-- prioritization_outputs/by_library/<library_key>/candidate_prioritization_table.csv
-- prioritization_outputs/by_library/<library_key>/recommended_candidates.csv
-- prioritization_outputs/by_library/<library_key>/region_support/*.csv
-
-Core rules
-----------
-1. seq_uid only refers to a full-length sequence identity:
-       H_FL:<H_FL_PEP>|L_FL:<L_FL_PEP>
-2. VHH is treated as an antibody with an empty light chain.
-3. scFv candidates must have both H_FL_PEP and L_FL_PEP when strict_topology=True.
-4. Region counts are summed across all topology-valid full-length sequences
-   owning the region.
-5. Region representatives are chosen from positive samples only: latest positive
-   round first, highest read count second.
-6. Negative samples never choose representatives. They only mark positive
-   candidates/representatives as negative-associated when the same seq_uid is
-   observed in a negative sample.
+The module reads one library at a time. LLM integration is intentionally
+disabled in this version.
 """
 
 from __future__ import annotations
@@ -52,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .metadata import build_sample_metadata, discover_annotated_files
-from .uid import append_seq_uid_column, clean_str, make_seq_uid
+from .uid import append_seq_uid_column, clean_str
 
 
 DEFAULT_REGION_SPECS = [
@@ -61,75 +28,170 @@ DEFAULT_REGION_SPECS = [
     "H_FL_PEP-L_FL_PEP",
 ]
 
+SAMPLE_METADATA_OUTPUT_COLUMNS = [
+    "sample_id",
+    "library_key",
+    "library_type",
+    "round",
+    "condition",
+    "negative_type",
+    "annotated_file",
+]
+
+LIBRARY_MANIFEST_COLUMNS = [
+    "library_key",
+    "library_dir",
+    "n_samples",
+    "n_positive_samples",
+    "n_negative_samples",
+    "n_candidates",
+    "candidate_table",
+]
+
 CORE_SEQUENCE_COLUMNS = [
-    "Seq",
-    "Count",
-    "DNA",
     "H_CDR3_PEP",
-    "L_CDR3_PEP",
+    "H_CDR3_DEGENERATED_PEP",
     "H_CDRs_PEP",
     "L_CDRs_PEP",
+    "HL_CDRs_DEGENERATED_PEP",
     "H_FL_PEP",
     "L_FL_PEP",
+    "L_CDR3_PEP",
     "H_V_Gene",
     "H_J_Gene",
     "L_V_Gene",
     "L_J_Gene",
-    "H_DNA",
-    "L_DNA",
+    "H_FL_DNA",
+    "L_FL_DNA",
 ]
 
-
-# -----------------------------------------------------------------------------
-# Small helpers
-# -----------------------------------------------------------------------------
+# Reduced 11-class amino-acid alphabet agreed for similarity inspection:
+# AG / DE / FY / ILMV / KR / NQ / ST / C / H / P / W
+AA_DEGENERATION_MAP = {
+    "A": "A",
+    "G": "A",
+    "D": "D",
+    "E": "D",
+    "F": "F",
+    "Y": "F",
+    "I": "I",
+    "L": "I",
+    "M": "I",
+    "V": "I",
+    "K": "K",
+    "R": "K",
+    "N": "N",
+    "Q": "N",
+    "S": "S",
+    "T": "S",
+    "C": "C",
+    "H": "H",
+    "P": "P",
+    "W": "W",
+}
 
 
 def find_count_col(df: pd.DataFrame) -> str:
-    for col in ["Count", "count", "Read_Count", "read_count", "Reads", "reads"]:
-        if col in df.columns:
-            return col
-    raise ValueError("Could not find a read-count column. Expected Count/count/Read_Count/reads.")
+    for column in ["Count", "count", "Read_Count", "read_count", "Reads", "reads"]:
+        if column in df.columns:
+            return column
+    raise ValueError(
+        "Could not find a read-count column. "
+        "Expected Count/count/Read_Count/read_count/Reads/reads."
+    )
 
 
 def make_display_id(row: pd.Series, fallback: str) -> str:
-    for col in ["display_id", "ID", "Seq_ID", "seq_id", "sequence_id", "Name", "name"]:
-        if col in row.index and clean_str(row[col]):
-            return clean_str(row[col])
+    for column in [
+        "display_id",
+        "ID",
+        "Seq_ID",
+        "seq_id",
+        "sequence_id",
+        "Name",
+        "name",
+    ]:
+        if column in row.index and clean_str(row[column]):
+            return clean_str(row[column])
     return fallback
 
 
+def degenerate_sequence(value: object) -> str:
+    """Convert an amino-acid sequence to the reduced 11-class alphabet."""
+    sequence = re.sub(r"\s+", "", clean_str(value)).upper()
+    if not sequence:
+        return ""
+    return "".join(AA_DEGENERATION_MAP.get(residue, "X") for residue in sequence)
+
+
+def add_degenerated_sequence_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add the two reduced-alphabet columns used by the current analysis layers.
+
+    H_CDR3_DEGENERATED_PEP:
+        reduced H_CDR3 sequence
+
+    HL_CDRs_DEGENERATED_PEP:
+        reduced H_CDRs and L_CDRs joined in canonical H-L order
+    """
+    out = df.copy()
+
+    if "H_CDR3_PEP" in out.columns:
+        out["H_CDR3_DEGENERATED_PEP"] = out["H_CDR3_PEP"].map(
+            degenerate_sequence
+        )
+    else:
+        out["H_CDR3_DEGENERATED_PEP"] = ""
+
+    h_cdrs = (
+        out["H_CDRs_PEP"].map(degenerate_sequence)
+        if "H_CDRs_PEP" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    l_cdrs = (
+        out["L_CDRs_PEP"].map(degenerate_sequence)
+        if "L_CDRs_PEP" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+
+    out["HL_CDRs_DEGENERATED_PEP"] = (
+        "H:" + h_cdrs.astype(str) + "|L:" + l_cdrs.astype(str)
+    )
+    return out
+
+
 def region_columns(region_spec: str) -> List[str]:
-    return [x.strip() for x in str(region_spec).split("-") if x.strip()]
+    return [item.strip() for item in str(region_spec).split("-") if item.strip()]
 
 
 def build_region_key(row: pd.Series, region_spec: str) -> str:
-    parts = [clean_str(row.get(col, "")) for col in region_columns(region_spec)]
+    parts = [clean_str(row.get(column, "")) for column in region_columns(region_spec)]
     if not any(parts):
         return ""
     return "-".join(parts)
 
 
 def build_region_key_series(df: pd.DataFrame, region_spec: str) -> pd.Series:
-    cols = region_columns(region_spec)
-    if not cols:
+    columns = region_columns(region_spec)
+    if not columns:
         return pd.Series([""] * len(df), index=df.index)
-    values = []
-    for col in cols:
-        if col in df.columns:
-            s = df[col].map(clean_str)
+
+    values: List[pd.Series] = []
+    for column in columns:
+        if column in df.columns:
+            values.append(df[column].map(clean_str))
         else:
-            s = pd.Series([""] * len(df), index=df.index)
-        values.append(s)
-    if len(values) == 1:
-        key = values[0]
-    else:
-        key = values[0].astype(str)
-        for s in values[1:]:
-            key = key + "-" + s.astype(str)
-    all_empty = pd.concat(values, axis=1).apply(lambda r: not any(r.astype(str)), axis=1)
-    key = key.mask(all_empty, "")
-    return key
+            values.append(pd.Series([""] * len(df), index=df.index))
+
+    key = values[0].astype(str)
+    for series in values[1:]:
+        key = key + "-" + series.astype(str)
+
+    all_empty = pd.concat(values, axis=1).apply(
+        lambda row: not any(row.astype(str)),
+        axis=1,
+    )
+    return key.mask(all_empty, "")
 
 
 def safe_filename(name: str) -> str:
@@ -163,10 +225,8 @@ def make_library_key_from_sample_id(sample_id: object) -> str:
         if not token:
             continue
 
-        # Old style: <LIB>_R2 -> <LIB>
         token = re.sub(r"_R\d+(?=_|$)", "", token, flags=re.IGNORECASE)
 
-        # New FAO2 metadata tokens should not define the library.
         if re.match(r"^round-?R?\d+$", token, flags=re.IGNORECASE):
             continue
         if re.match(r"^cond-", token, flags=re.IGNORECASE):
@@ -178,18 +238,25 @@ def make_library_key_from_sample_id(sample_id: object) -> str:
         if re.match(r"^dup\d+$", token, flags=re.IGNORECASE):
             continue
 
-        if token:
-            kept.append(token)
+        kept.append(token)
 
     return "__".join(kept) if kept else text
 
 
 def add_library_keys(metadata: pd.DataFrame) -> pd.DataFrame:
-    meta = metadata.copy()
-    meta["sample_id"] = meta["sample_id"].astype(str)
-    meta["library_key"] = meta["sample_id"].apply(make_library_key_from_sample_id)
-    meta["round_num"] = pd.to_numeric(meta.get("round", pd.NA), errors="coerce")
-    return meta
+    out = metadata.copy()
+    out["sample_id"] = out["sample_id"].astype(str)
+    out["library_key"] = out["sample_id"].apply(make_library_key_from_sample_id)
+    out["round_num"] = pd.to_numeric(out.get("round", pd.NA), errors="coerce")
+    return out
+
+
+def metadata_output_view(metadata: pd.DataFrame) -> pd.DataFrame:
+    out = metadata.copy()
+    for column in SAMPLE_METADATA_OUTPUT_COLUMNS:
+        if column not in out.columns:
+            out[column] = ""
+    return out[SAMPLE_METADATA_OUTPUT_COLUMNS]
 
 
 def positive_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -200,27 +267,23 @@ def negative_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["condition"].astype(str).str.lower().eq("neg")].copy()
 
 
-# -----------------------------------------------------------------------------
-# Metadata discovery
-# -----------------------------------------------------------------------------
-
-
-def prepare_sample_metadata(parser_out: str | Path, output_dir: str | Path) -> pd.DataFrame:
+def prepare_sample_metadata(
+    parser_out: str | Path,
+    output_dir: str | Path,
+) -> pd.DataFrame:
     files = discover_annotated_files(parser_out)
     if not files:
         raise FileNotFoundError(f"No *_annotated.csv files found under {parser_out}")
-    metadata = build_sample_metadata(files)
-    metadata = add_library_keys(metadata)
 
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    metadata.to_csv(out_dir / "sample_metadata.csv", index=False)
+    metadata = add_library_keys(build_sample_metadata(files))
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    metadata_output_view(metadata).to_csv(
+        output / "sample_metadata.csv",
+        index=False,
+    )
     return metadata
-
-
-# -----------------------------------------------------------------------------
-# Per-library loading
-# -----------------------------------------------------------------------------
 
 
 def load_library_annotated(
@@ -232,8 +295,8 @@ def load_library_annotated(
     tables: List[pd.DataFrame] = []
 
     for _, meta in lib_meta.iterrows():
-        f = Path(meta["annotated_file"])
-        df = pd.read_csv(f, keep_default_na=False)
+        annotated_file = Path(meta["annotated_file"])
+        df = pd.read_csv(annotated_file, keep_default_na=False)
         library_type = str(meta.get("library_type", "unknown"))
 
         df = append_seq_uid_column(
@@ -241,41 +304,52 @@ def load_library_annotated(
             library_type=library_type,
             strict_topology=strict_topology,
         )
-        if write_annotated_uid:
-            df.to_csv(f, index=False)
 
-        count_col = find_count_col(df)
-        df["__count"] = pd.to_numeric(df[count_col], errors="coerce").fillna(0).astype(int)
+        if write_annotated_uid:
+            # Parser output remains unchanged except for the final seq_uid column.
+            df.to_csv(annotated_file, index=False)
+
+        df = add_degenerated_sequence_columns(df)
+
+        count_column = find_count_col(df)
+        df["__count"] = (
+            pd.to_numeric(df[count_column], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
         df["sample_id"] = str(meta["sample_id"])
         df["library_key"] = str(meta["library_key"])
         df["library_type"] = library_type
         df["round"] = meta.get("round", pd.NA)
-        df["round_num"] = pd.to_numeric(meta.get("round", pd.NA), errors="coerce")
+        df["round_num"] = pd.to_numeric(
+            meta.get("round", pd.NA),
+            errors="coerce",
+        )
         df["condition"] = meta.get("condition", "unknown")
         df["negative_type"] = meta.get("negative_type", "")
-        df["source_annotated_file"] = str(f)
         df["display_id"] = [
-            make_display_id(row, f"{meta['sample_id']}__row{i + 1}")
-            for i, row in df.iterrows()
+            make_display_id(row, f"{meta['sample_id']}__row{index + 1}")
+            for index, (_, row) in enumerate(df.iterrows())
         ]
+
         tables.append(df)
 
     if not tables:
         return pd.DataFrame()
+
     return pd.concat(tables, ignore_index=True, sort=False)
 
 
-# -----------------------------------------------------------------------------
-# Region support
-# -----------------------------------------------------------------------------
-
-
 def build_negative_uid_map(df: pd.DataFrame) -> Dict[str, List[str]]:
-    neg = negative_rows(df)
-    neg = neg[(neg["seq_uid"].astype(str).str.len() > 0) & (neg["__count"] > 0)]
+    negative = negative_rows(df)
+    negative = negative[
+        (negative["seq_uid"].astype(str).str.len() > 0)
+        & (negative["__count"] > 0)
+    ]
+
     out: Dict[str, List[str]] = {}
-    for uid, sub in neg.groupby("seq_uid"):
-        out[str(uid)] = sorted(set(sub["sample_id"].astype(str)))
+    for uid, group in negative.groupby("seq_uid"):
+        out[str(uid)] = sorted(set(group["sample_id"].astype(str)))
     return out
 
 
@@ -285,12 +359,12 @@ def build_region_support_tables(
     region_specs: Sequence[str],
     output_dir: str | Path,
 ) -> Dict[str, pd.DataFrame]:
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    region_tables: Dict[str, pd.DataFrame] = {}
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
 
+    region_tables: Dict[str, pd.DataFrame] = {}
     valid = annotated[annotated["seq_uid"].astype(str).str.len() > 0].copy()
-    neg_uid_to_samples = build_negative_uid_map(valid)
+    negative_uid_to_samples = build_negative_uid_map(valid)
     sample_order = list(metadata["sample_id"].astype(str))
 
     for spec in region_specs:
@@ -299,15 +373,19 @@ def build_region_support_tables(
         df["region_key"] = build_region_key_series(df, spec)
         df = df[df["region_key"].astype(str).str.len() > 0].copy()
 
-        out_path = out_dir / safe_filename(f"region_support__{spec}.csv")
+        output_path = output / safe_filename(f"region_support__{spec}.csv")
+
         if df.empty:
             empty = pd.DataFrame(columns=["region_spec", "region_key"])
-            empty.to_csv(out_path, index=False)
+            empty.to_csv(output_path, index=False)
             region_tables[spec] = empty
             continue
 
         grouped = (
-            df.groupby(["region_spec", "region_key", "sample_id"], as_index=False)["__count"]
+            df.groupby(
+                ["region_spec", "region_key", "sample_id"],
+                as_index=False,
+            )["__count"]
             .sum()
             .rename(columns={"__count": "region_sample_count"})
         )
@@ -319,23 +397,31 @@ def build_region_support_tables(
             aggfunc="sum",
             fill_value=0,
         ).reset_index()
-        count_wide.columns = [str(c) for c in count_wide.columns]
+        count_wide.columns = [str(column) for column in count_wide.columns]
 
-        pos = positive_rows(df)
-        rep_records: List[Dict[str, object]] = []
+        positive = positive_rows(df)
+        representative_records: List[Dict[str, object]] = []
 
-        for (region_spec, region_key), sub in pos.groupby(["region_spec", "region_key"]):
-            sub_valid = sub[sub["seq_uid"].astype(str).str.len() > 0].copy()
-            if sub_valid.empty:
+        for (region_spec, region_key), group in positive.groupby(
+            ["region_spec", "region_key"]
+        ):
+            group = group[group["seq_uid"].astype(str).str.len() > 0].copy()
+            if group.empty:
                 continue
 
-            sub_valid["__round_sort"] = pd.to_numeric(sub_valid["round_num"], errors="coerce").fillna(-1)
-            latest_round = sub_valid["__round_sort"].max()
-            latest = sub_valid[sub_valid["__round_sort"].eq(latest_round)].copy()
-            latest = latest.sort_values(["__count", "seq_uid"], ascending=[False, True])
-            rep = latest.iloc[0]
+            group["__round_sort"] = (
+                pd.to_numeric(group["round_num"], errors="coerce")
+                .fillna(-1)
+            )
+            latest_round = group["__round_sort"].max()
+            latest = group[group["__round_sort"].eq(latest_round)].copy()
+            latest = latest.sort_values(
+                ["__count", "seq_uid"],
+                ascending=[False, True],
+            )
+            representative = latest.iloc[0]
 
-            source_sample = str(rep["sample_id"])
+            source_sample = str(representative["sample_id"])
             region_count_same_sample = int(
                 grouped[
                     grouped["region_spec"].eq(region_spec)
@@ -343,52 +429,72 @@ def build_region_support_tables(
                     & grouped["sample_id"].astype(str).eq(source_sample)
                 ]["region_sample_count"].sum()
             )
-            rep_count = int(rep["__count"])
-            fraction = rep_count / region_count_same_sample if region_count_same_sample > 0 else np.nan
-            rep_uid = str(rep["seq_uid"])
-            neg_samples = neg_uid_to_samples.get(rep_uid, [])
+            representative_count = int(representative["__count"])
+            fraction = (
+                representative_count / region_count_same_sample
+                if region_count_same_sample > 0
+                else np.nan
+            )
 
-            rep_records.append(
+            representative_uid = str(representative["seq_uid"])
+            negative_samples = negative_uid_to_samples.get(
+                representative_uid,
+                [],
+            )
+
+            representative_records.append(
                 {
                     "region_spec": region_spec,
                     "region_key": region_key,
-                    "representative_seq_uid": rep_uid,
-                    "representative_display_id": rep.get("display_id", ""),
+                    "representative_seq_uid": representative_uid,
+                    "representative_display_id": representative.get(
+                        "display_id",
+                        "",
+                    ),
                     "representative_source_sample": source_sample,
-                    "representative_count": rep_count,
+                    "representative_count": representative_count,
                     "representative_region_count": region_count_same_sample,
                     "representative_region_fraction": fraction,
-                    "negative_flag": "negative_hit" if neg_samples else "clean_or_unknown",
-                    "negative_sample_hit": ";".join(neg_samples),
+                    "negative_flag": (
+                        "negative_hit"
+                        if negative_samples
+                        else "clean_or_unknown"
+                    ),
+                    "negative_sample_hit": ";".join(negative_samples),
                 }
             )
 
-        reps = pd.DataFrame(rep_records)
-        if reps.empty:
-            merged = count_wide
-        else:
-            merged = count_wide.merge(reps, on=["region_spec", "region_key"], how="left")
+        representatives = pd.DataFrame(representative_records)
+        merged = (
+            count_wide
+            if representatives.empty
+            else count_wide.merge(
+                representatives,
+                on=["region_spec", "region_key"],
+                how="left",
+            )
+        )
 
         front = ["region_spec", "region_key"]
-        sample_cols = [s for s in sample_order if s in merged.columns]
-        extra_cols = [c for c in merged.columns if c not in front + sample_cols]
-        merged = merged[front + sample_cols + extra_cols]
-        merged.to_csv(out_path, index=False)
+        sample_columns = [
+            sample for sample in sample_order if sample in merged.columns
+        ]
+        other_columns = [
+            column
+            for column in merged.columns
+            if column not in front + sample_columns
+        ]
+        merged = merged[front + sample_columns + other_columns]
+        merged.to_csv(output_path, index=False)
         region_tables[spec] = merged
 
     return region_tables
-
-
-# -----------------------------------------------------------------------------
-# Candidate table
-# -----------------------------------------------------------------------------
 
 
 def build_candidate_table(
     annotated: pd.DataFrame,
     metadata: pd.DataFrame,
     region_tables: Dict[str, pd.DataFrame],
-    llm_clusters: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     valid = annotated[annotated["seq_uid"].astype(str).str.len() > 0].copy()
     if valid.empty:
@@ -402,75 +508,135 @@ def build_candidate_table(
         aggfunc="sum",
         fill_value=0,
     ).reset_index()
-    count_wide.columns = [str(c) for c in count_wide.columns]
-    for sid in sample_order:
-        if sid not in count_wide.columns:
-            count_wide[sid] = 0
+    count_wide.columns = [str(column) for column in count_wide.columns]
 
-    rows: List[Dict[str, object]] = []
-    pos = positive_rows(valid)
+    for sample_id in sample_order:
+        if sample_id not in count_wide.columns:
+            count_wide[sample_id] = 0
 
-    for uid, sub_all in valid.groupby("seq_uid"):
-        sub_pos = pos[pos["seq_uid"].eq(uid)].copy()
-        if not sub_pos.empty:
-            sub_pos["__round_sort"] = pd.to_numeric(sub_pos["round_num"], errors="coerce").fillna(-1)
-            latest_round = sub_pos["__round_sort"].max()
-            choices = sub_pos[sub_pos["__round_sort"].eq(latest_round)].copy()
+    positive = positive_rows(valid)
+    records: List[Dict[str, object]] = []
+
+    for uid, all_rows in valid.groupby("seq_uid"):
+        positive_rows_for_uid = positive[positive["seq_uid"].eq(uid)].copy()
+
+        if not positive_rows_for_uid.empty:
+            positive_rows_for_uid["__round_sort"] = (
+                pd.to_numeric(
+                    positive_rows_for_uid["round_num"],
+                    errors="coerce",
+                ).fillna(-1)
+            )
+            latest_round = positive_rows_for_uid["__round_sort"].max()
+            choices = positive_rows_for_uid[
+                positive_rows_for_uid["__round_sort"].eq(latest_round)
+            ].copy()
         else:
-            choices = sub_all.copy()
-            choices["__round_sort"] = pd.to_numeric(choices["round_num"], errors="coerce").fillna(-1)
+            choices = all_rows.copy()
+            choices["__round_sort"] = (
+                pd.to_numeric(choices["round_num"], errors="coerce")
+                .fillna(-1)
+            )
 
-        choices = choices.sort_values(["__count", "sample_id"], ascending=[False, True])
-        rep = choices.iloc[0]
+        choices = choices.sort_values(
+            ["__count", "sample_id"],
+            ascending=[False, True],
+        )
+        representative = choices.iloc[0]
 
-        rec: Dict[str, object] = {"seq_uid": uid}
-        for col in CORE_SEQUENCE_COLUMNS:
-            if col in rep.index:
-                rec[col] = rep[col]
-        rec.update(
+        record: Dict[str, object] = {"seq_uid": uid}
+        for column in CORE_SEQUENCE_COLUMNS:
+            if column in representative.index:
+                record[column] = representative[column]
+
+        record.update(
             {
-                "display_id": rep.get("display_id", ""),
-                "source_sample_id": rep.get("sample_id", ""),
-                "source_annotated_file": rep.get("source_annotated_file", ""),
-                "library_key": rep.get("library_key", ""),
-                "library_type": rep.get("library_type", "unknown"),
-                "representative_count_in_source": int(rep.get("__count", 0)),
+                "display_id": representative.get("display_id", ""),
+                "source_sample_id": representative.get("sample_id", ""),
+                "library_key": representative.get("library_key", ""),
+                "library_type": representative.get(
+                    "library_type",
+                    "unknown",
+                ),
+                "representative_count_in_source": int(
+                    representative.get("__count", 0)
+                ),
             }
         )
-        rows.append(rec)
+        records.append(record)
 
-    base = pd.DataFrame(rows)
+    base = pd.DataFrame(records)
     out = base.merge(count_wide, on="seq_uid", how="left")
 
-    pos_samples = metadata[metadata["condition"].astype(str).str.lower().eq("pos")]["sample_id"].astype(str).tolist()
-    neg_samples = metadata[metadata["condition"].astype(str).str.lower().eq("neg")]["sample_id"].astype(str).tolist()
+    positive_samples = metadata[
+        metadata["condition"].astype(str).str.lower().eq("pos")
+    ]["sample_id"].astype(str).tolist()
+    negative_samples = metadata[
+        metadata["condition"].astype(str).str.lower().eq("neg")
+    ]["sample_id"].astype(str).tolist()
 
-    for sid in pos_samples + neg_samples:
-        if sid not in out.columns:
-            out[sid] = 0
+    for sample_id in positive_samples + negative_samples:
+        if sample_id not in out.columns:
+            out[sample_id] = 0
 
-    out["total_positive_count"] = out[pos_samples].sum(axis=1) if pos_samples else 0
-    out["total_negative_count"] = out[neg_samples].sum(axis=1) if neg_samples else 0
-    out["negative_flag"] = np.where(out["total_negative_count"] > 0, "negative_hit", "clean_or_unknown")
+    out["total_positive_count"] = (
+        out[positive_samples].sum(axis=1)
+        if positive_samples
+        else 0
+    )
+    out["total_negative_count"] = (
+        out[negative_samples].sum(axis=1)
+        if negative_samples
+        else 0
+    )
+    out["negative_flag"] = np.where(
+        out["total_negative_count"] > 0,
+        "negative_hit",
+        "clean_or_unknown",
+    )
     out["negative_sample_hit"] = out.apply(
-        lambda r: ";".join([sid for sid in neg_samples if int(r.get(sid, 0)) > 0]), axis=1
+        lambda row: ";".join(
+            [
+                sample_id
+                for sample_id in negative_samples
+                if int(row.get(sample_id, 0)) > 0
+            ]
+        ),
+        axis=1,
     )
     out["detected_positive_samples"] = out.apply(
-        lambda r: ";".join([sid for sid in pos_samples if int(r.get(sid, 0)) > 0]), axis=1
+        lambda row: ";".join(
+            [
+                sample_id
+                for sample_id in positive_samples
+                if int(row.get(sample_id, 0)) > 0
+            ]
+        ),
+        axis=1,
     )
     out["detected_positive_sample_count"] = out.apply(
-        lambda r: sum(int(r.get(sid, 0)) > 0 for sid in pos_samples), axis=1
+        lambda row: sum(
+            int(row.get(sample_id, 0)) > 0
+            for sample_id in positive_samples
+        ),
+        axis=1,
     )
-    out["trajectory_class"] = out.apply(lambda r: classify_trajectory(r, metadata), axis=1)
+    out["trajectory_class"] = out.apply(
+        lambda row: classify_trajectory(row, metadata),
+        axis=1,
+    )
 
     for spec, table in region_tables.items():
         if table.empty:
             continue
 
         prefix = region_prefix(spec)
-        out[f"{prefix}_region_key"] = out.apply(lambda r: build_region_key(r, spec), axis=1)
+        out[f"{prefix}_region_key"] = out.apply(
+            lambda row: build_region_key(row, spec),
+            axis=1,
+        )
 
-        keep_cols = [
+        keep_columns = [
             "region_key",
             "representative_seq_uid",
             "representative_region_fraction",
@@ -479,32 +645,60 @@ def build_candidate_table(
             "negative_flag",
             "negative_sample_hit",
         ]
-        keep_cols = [c for c in keep_cols if c in table.columns]
-        tmp = table[keep_cols].copy()
-        tmp = tmp.rename(
+        keep_columns = [
+            column for column in keep_columns if column in table.columns
+        ]
+        temporary = table[keep_columns].copy()
+        temporary = temporary.rename(
             columns={
-                "representative_seq_uid": f"{prefix}_representative_seq_uid",
-                "representative_region_fraction": f"{prefix}_representative_region_fraction",
-                "representative_count": f"{prefix}_representative_count",
-                "representative_region_count": f"{prefix}_representative_region_count",
-                "negative_flag": f"{prefix}_region_negative_flag",
-                "negative_sample_hit": f"{prefix}_region_negative_sample_hit",
+                "representative_seq_uid": (
+                    f"{prefix}_representative_seq_uid"
+                ),
+                "representative_region_fraction": (
+                    f"{prefix}_representative_region_fraction"
+                ),
+                "representative_count": (
+                    f"{prefix}_representative_count"
+                ),
+                "representative_region_count": (
+                    f"{prefix}_representative_region_count"
+                ),
+                "negative_flag": (
+                    f"{prefix}_region_negative_flag"
+                ),
+                "negative_sample_hit": (
+                    f"{prefix}_region_negative_sample_hit"
+                ),
             }
         )
-        out = out.merge(tmp, left_on=f"{prefix}_region_key", right_on="region_key", how="left")
+        out = out.merge(
+            temporary,
+            left_on=f"{prefix}_region_key",
+            right_on="region_key",
+            how="left",
+        )
         out = out.drop(columns=["region_key"], errors="ignore")
 
-        rep_col = f"{prefix}_representative_seq_uid"
-        if rep_col in out.columns:
-            out[f"{prefix}_is_region_representative"] = out["seq_uid"].astype(str).eq(out[rep_col].astype(str))
+        representative_column = f"{prefix}_representative_seq_uid"
+        if representative_column in out.columns:
+            out[f"{prefix}_is_region_representative"] = (
+                out["seq_uid"].astype(str).eq(
+                    out[representative_column].astype(str)
+                )
+            )
 
-    if llm_clusters is not None and not llm_clusters.empty:
-        out = merge_llm_clusters(out, llm_clusters)
+    # LLM integration is intentionally disabled in this version.
+    # The old implementation loaded an external clustering table and merged all
+    # non-sequence columns by seq_uid:
+    #
+    # llm = load_llm_clusters(llm_clusters)
+    # if llm is not None and not llm.empty:
+    #     out = merge_llm_clusters(out, llm)
 
-    priority_result = out.apply(assign_priority, axis=1)
-    out["priority_tier"] = [x[0] for x in priority_result]
-    out["priority_class"] = [x[1] for x in priority_result]
-    out["decision_reason"] = [x[2] for x in priority_result]
+    priority_results = out.apply(assign_priority, axis=1)
+    out["priority_tier"] = [result[0] for result in priority_results]
+    out["priority_class"] = [result[1] for result in priority_results]
+    out["decision_reason"] = [result[2] for result in priority_results]
 
     front = [
         "seq_uid",
@@ -518,131 +712,145 @@ def build_candidate_table(
         "library_type",
         "trajectory_class",
     ]
-    front = [c for c in front if c in out.columns]
-    out = out[front + [c for c in out.columns if c not in front]]
-    return out
+    front = [column for column in front if column in out.columns]
+    return out[front + [column for column in out.columns if column not in front]]
 
 
-# -----------------------------------------------------------------------------
-# Priority / trajectory
-# -----------------------------------------------------------------------------
+def classify_trajectory(
+    row: pd.Series,
+    metadata: pd.DataFrame,
+) -> str:
+    positive_metadata = metadata[
+        metadata["condition"].astype(str).str.lower().eq("pos")
+    ].copy()
 
-
-def classify_trajectory(row: pd.Series, metadata: pd.DataFrame) -> str:
-    pos_meta = metadata[metadata["condition"].astype(str).str.lower().eq("pos")].copy()
-    if pos_meta.empty:
+    if positive_metadata.empty:
         return "positive_unknown"
 
-    pos_meta["round_sort"] = pd.to_numeric(pos_meta["round"], errors="coerce").fillna(-1)
-    pos_meta = pos_meta.sort_values(["round_sort", "sample_id"])
-    counts = [int(row.get(str(sid), 0)) for sid in pos_meta["sample_id"].astype(str)]
-    nonzero = [(i, c) for i, c in enumerate(counts) if c > 0]
+    positive_metadata["round_sort"] = (
+        pd.to_numeric(positive_metadata["round"], errors="coerce")
+        .fillna(-1)
+    )
+    positive_metadata = positive_metadata.sort_values(
+        ["round_sort", "sample_id"]
+    )
+
+    counts = [
+        int(row.get(str(sample_id), 0))
+        for sample_id in positive_metadata["sample_id"].astype(str)
+    ]
+    nonzero = [
+        (index, count)
+        for index, count in enumerate(counts)
+        if count > 0
+    ]
 
     if not nonzero:
         return "not_in_positive"
     if len(nonzero) == 1:
-        i, _ = nonzero[0]
-        if i == len(counts) - 1:
-            return "final_only"
-        return "one_positive_sample_only"
+        index, _ = nonzero[0]
+        return (
+            "final_only"
+            if index == len(counts) - 1
+            else "one_positive_sample_only"
+        )
 
     final = counts[-1]
-    prev = counts[-2] if len(counts) >= 2 else 0
+    previous = counts[-2] if len(counts) >= 2 else 0
     first_nonzero = nonzero[0][1]
 
     if final == 0:
         return "lost_before_final"
-    if final < prev:
+    if final < previous:
         return "declining_late"
 
-    start_idx = nonzero[0][0]
-    tail = counts[start_idx:]
-    if all(tail[i] <= tail[i + 1] for i in range(len(tail) - 1)):
-        if first_nonzero <= 50 and final >= max(500, first_nonzero * 10):
+    start_index = nonzero[0][0]
+    tail = counts[start_index:]
+
+    if all(
+        tail[index] <= tail[index + 1]
+        for index in range(len(tail) - 1)
+    ):
+        if (
+            first_nonzero <= 50
+            and final >= max(500, first_nonzero * 10)
+        ):
             return "rare_fast"
         return "steady_rising"
 
     if final >= max(counts):
         return "late_rising"
+
     return "mixed"
 
 
 def assign_priority(row: pd.Series) -> Tuple[str, str, str]:
     if str(row.get("negative_flag", "")).lower() == "negative_hit":
-        return "Reject_dirty", "E_negative_dirty", "seq_uid observed in negative sample"
+        return (
+            "Reject_dirty",
+            "E_negative_dirty",
+            "seq_uid observed in negative sample",
+        )
 
-    traj = str(row.get("trajectory_class", ""))
-    total_pos = int(row.get("total_positive_count", 0))
+    trajectory = str(row.get("trajectory_class", ""))
+    total_positive = int(row.get("total_positive_count", 0))
     detected = int(row.get("detected_positive_sample_count", 0))
 
-    if traj in {"steady_rising", "late_rising"} and total_pos > 0:
-        return "Pick", "A_rising_candidate", f"{traj}; positive count={total_pos}"
-    if traj == "rare_fast":
-        return "Diversity_pick", "B_rare_fast_supported", "rare-fast positive trajectory"
-    if detected >= 2 and total_pos > 0:
-        return "Pick", "A_multi_round_candidate", f"detected in {detected} positive samples"
-    if traj in {"final_only", "one_positive_sample_only"} and total_pos >= 100:
-        return "Backup", "C_single_round_candidate", f"single positive sample; count={total_pos}"
-    if total_pos > 0:
-        return "Backup", "D_low_or_mixed_evidence", f"positive count={total_pos}; trajectory={traj}"
-    return "Deprioritize", "F_no_positive_evidence", "not detected in positive samples"
+    if trajectory in {"steady_rising", "late_rising"} and total_positive > 0:
+        return (
+            "Pick",
+            "A_rising_candidate",
+            f"{trajectory}; positive count={total_positive}",
+        )
+    if trajectory == "rare_fast":
+        return (
+            "Diversity_pick",
+            "B_rare_fast_supported",
+            "rare-fast positive trajectory",
+        )
+    if detected >= 2 and total_positive > 0:
+        return (
+            "Pick",
+            "A_multi_round_candidate",
+            f"detected in {detected} positive samples",
+        )
+    if (
+        trajectory in {"final_only", "one_positive_sample_only"}
+        and total_positive >= 100
+    ):
+        return (
+            "Backup",
+            "C_single_round_candidate",
+            f"single positive sample; count={total_positive}",
+        )
+    if total_positive > 0:
+        return (
+            "Backup",
+            "D_low_or_mixed_evidence",
+            f"positive count={total_positive}; trajectory={trajectory}",
+        )
+
+    return (
+        "Deprioritize",
+        "F_no_positive_evidence",
+        "not detected in positive samples",
+    )
 
 
-# -----------------------------------------------------------------------------
-# LLM clustering
-# -----------------------------------------------------------------------------
-
-
-def load_llm_clusters(path: Optional[str | Path]) -> Optional[pd.DataFrame]:
-    if not path:
-        return None
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"LLM clustering file not found: {p}")
-    if p.suffix.lower() in {".xlsx", ".xls"}:
-        llm = pd.read_excel(p)
-    else:
-        llm = pd.read_csv(p, keep_default_na=False)
-
-    if "seq_uid" not in llm.columns:
-        if "H_FL_PEP" in llm.columns:
-            if "L_FL_PEP" not in llm.columns:
-                llm["L_FL_PEP"] = ""
-            llm["seq_uid"] = [make_seq_uid(h, l) for h, l in zip(llm["H_FL_PEP"], llm["L_FL_PEP"])]
-        else:
-            raise ValueError("LLM clustering file must contain seq_uid or H_FL_PEP/L_FL_PEP columns.")
-
-    drop_cols = [c for c in ["H_FL_PEP", "L_FL_PEP", "H_CDR3_PEP", "L_CDR3_PEP"] if c in llm.columns]
-    llm = llm.drop(columns=drop_cols, errors="ignore")
-    llm = llm.drop_duplicates("seq_uid")
-    return llm
-
-
-def merge_llm_clusters(candidates: pd.DataFrame, llm: pd.DataFrame) -> pd.DataFrame:
-    return candidates.merge(llm, on="seq_uid", how="left")
-
-
-# -----------------------------------------------------------------------------
-# Output helpers
-# -----------------------------------------------------------------------------
-
-
-def write_recommended_candidates(candidates: pd.DataFrame, output_path: Path) -> None:
+def write_recommended_candidates(
+    candidates: pd.DataFrame,
+    output_path: Path,
+) -> None:
     if candidates.empty:
         candidates.to_csv(output_path, index=False)
         return
 
     keep_tiers = {"Pick", "Diversity_pick", "Backup", "Control"}
-    out = candidates[
+    output = candidates[
         candidates["priority_tier"].astype(str).isin(keep_tiers)
         & candidates["negative_flag"].astype(str).ne("negative_hit")
     ].copy()
-    out.to_csv(output_path, index=False)
-
-
-# -----------------------------------------------------------------------------
-# Main API
-# -----------------------------------------------------------------------------
+    output.to_csv(output_path, index=False)
 
 
 def run_prioritization(
@@ -657,175 +865,288 @@ def run_prioritization(
     write_global_table: bool = False,
     library_key_filter: Optional[str] = None,
 ) -> Dict[str, Path]:
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
 
-    metadata = prepare_sample_metadata(parser_out, out_dir)
-    llm = load_llm_clusters(llm_clusters)
+    metadata = prepare_sample_metadata(parser_out, output)
+
+    # LLM integration is intentionally paused. The argument is retained to keep
+    # existing analysis_clean.py calls backward-compatible.
+    if llm_clusters:
+        print(
+            "Warning: llm_clusters was provided, but LLM integration is "
+            "disabled in this version and the file will be ignored."
+        )
 
     outputs: Dict[str, Path] = {
-        "sample_metadata": out_dir / "sample_metadata.csv",
+        "sample_metadata": output / "sample_metadata.csv",
     }
     manifest_records: List[Dict[str, object]] = []
 
     if not split_by_library:
-        # Backward-compatible global mode. This intentionally loads all samples.
-        metadata_global = metadata.copy()
-        metadata_global["library_key"] = "ALL_LIBRARIES"
+        global_metadata = metadata.copy()
+        global_metadata["library_key"] = "ALL_LIBRARIES"
+
         annotated = load_library_annotated(
-            metadata_global,
+            global_metadata,
             write_annotated_uid=write_annotated_uid,
             strict_topology=strict_topology,
         )
-        region_dir = out_dir / "region_support"
-        region_tables = build_region_support_tables(annotated, metadata_global, region_specs, region_dir)
-        candidates = build_candidate_table(annotated, metadata_global, region_tables, llm)
-        candidate_path = out_dir / "candidate_prioritization_table.csv"
+        region_directory = output / "region_support"
+        region_tables = build_region_support_tables(
+            annotated,
+            global_metadata,
+            region_specs,
+            region_directory,
+        )
+        candidates = build_candidate_table(
+            annotated,
+            global_metadata,
+            region_tables,
+        )
+
+        candidate_path = output / "candidate_prioritization_table.csv"
         candidates.to_csv(candidate_path, index=False)
-        write_recommended_candidates(candidates, out_dir / "recommended_candidates.csv")
+        write_recommended_candidates(
+            candidates,
+            output / "recommended_candidates.csv",
+        )
+
         outputs["candidate_table"] = candidate_path
-        outputs["region_support_dir"] = region_dir
+        outputs["region_support_dir"] = region_directory
         manifest_records.append(
             {
                 "library_key": "ALL_LIBRARIES",
-                "library_dir": str(out_dir),
-                "n_samples": int(len(metadata_global)),
-                "n_positive_samples": int((metadata_global["condition"].astype(str).str.lower() == "pos").sum()),
-                "n_negative_samples": int((metadata_global["condition"].astype(str).str.lower() == "neg").sum()),
+                "library_dir": str(output),
+                "n_samples": int(len(global_metadata)),
+                "n_positive_samples": int(
+                    global_metadata["condition"]
+                    .astype(str)
+                    .str.lower()
+                    .eq("pos")
+                    .sum()
+                ),
+                "n_negative_samples": int(
+                    global_metadata["condition"]
+                    .astype(str)
+                    .str.lower()
+                    .eq("neg")
+                    .sum()
+                ),
                 "n_candidates": int(len(candidates)),
                 "candidate_table": str(candidate_path),
             }
         )
     else:
-        library_root = out_dir / "by_library"
+        library_root = output / "by_library"
         library_root.mkdir(parents=True, exist_ok=True)
 
-        library_keys = sorted(metadata["library_key"].dropna().astype(str).unique())
+        library_keys = sorted(
+            metadata["library_key"].dropna().astype(str).unique()
+        )
         if library_key_filter:
             pattern = str(library_key_filter)
-            library_keys = [k for k in library_keys if pattern in k]
+            library_keys = [
+                key for key in library_keys if pattern in key
+            ]
 
         for library_key in library_keys:
-            lib_meta = metadata[metadata["library_key"].astype(str).eq(library_key)].copy()
-            if lib_meta.empty:
+            library_metadata = metadata[
+                metadata["library_key"].astype(str).eq(library_key)
+            ].copy()
+            if library_metadata.empty:
                 continue
 
-            lib_dir = library_root / safe_filename(library_key)
-            lib_dir.mkdir(parents=True, exist_ok=True)
-            lib_meta.to_csv(lib_dir / "sample_metadata.csv", index=False)
+            library_directory = library_root / safe_filename(library_key)
+            library_directory.mkdir(parents=True, exist_ok=True)
 
-            print(f"Processing library: {library_key} ({len(lib_meta)} samples)")
+            metadata_output_view(library_metadata).to_csv(
+                library_directory / "sample_metadata.csv",
+                index=False,
+            )
 
-            lib_annotated = load_library_annotated(
-                lib_meta,
+            print(
+                f"Processing library: {library_key} "
+                f"({len(library_metadata)} samples)"
+            )
+
+            annotated = load_library_annotated(
+                library_metadata,
                 write_annotated_uid=write_annotated_uid,
                 strict_topology=strict_topology,
             )
+            region_directory = library_directory / "region_support"
+            region_tables = build_region_support_tables(
+                annotated,
+                library_metadata,
+                region_specs,
+                region_directory,
+            )
+            candidates = build_candidate_table(
+                annotated,
+                library_metadata,
+                region_tables,
+            )
 
-            region_dir = lib_dir / "region_support"
-            region_tables = build_region_support_tables(lib_annotated, lib_meta, region_specs, region_dir)
-            candidates = build_candidate_table(lib_annotated, lib_meta, region_tables, llm)
-
-            candidate_path = lib_dir / "candidate_prioritization_table.csv"
+            candidate_path = (
+                library_directory / "candidate_prioritization_table.csv"
+            )
             candidates.to_csv(candidate_path, index=False)
-            write_recommended_candidates(candidates, lib_dir / "recommended_candidates.csv")
+            write_recommended_candidates(
+                candidates,
+                library_directory / "recommended_candidates.csv",
+            )
 
-            n_pos = int((lib_meta["condition"].astype(str).str.lower() == "pos").sum())
-            n_neg = int((lib_meta["condition"].astype(str).str.lower() == "neg").sum())
             manifest_records.append(
                 {
                     "library_key": library_key,
-                    "library_dir": str(lib_dir),
-                    "n_samples": int(len(lib_meta)),
-                    "n_positive_samples": n_pos,
-                    "n_negative_samples": n_neg,
+                    "library_dir": str(library_directory),
+                    "n_samples": int(len(library_metadata)),
+                    "n_positive_samples": int(
+                        library_metadata["condition"]
+                        .astype(str)
+                        .str.lower()
+                        .eq("pos")
+                        .sum()
+                    ),
+                    "n_negative_samples": int(
+                        library_metadata["condition"]
+                        .astype(str)
+                        .str.lower()
+                        .eq("neg")
+                        .sum()
+                    ),
                     "n_candidates": int(len(candidates)),
                     "candidate_table": str(candidate_path),
                 }
             )
 
-            del lib_annotated, region_tables, candidates
+            del annotated, region_tables, candidates
             gc.collect()
 
-        library_manifest = pd.DataFrame(manifest_records)
-        library_manifest_path = out_dir / "library_manifest.csv"
+        library_manifest = pd.DataFrame(
+            manifest_records,
+            columns=LIBRARY_MANIFEST_COLUMNS,
+        )
+        library_manifest_path = output / "library_manifest.csv"
         library_manifest.to_csv(library_manifest_path, index=False)
+
         outputs["library_manifest"] = library_manifest_path
         outputs["library_output_root"] = library_root
 
         if write_global_table:
-            candidate_paths = [Path(r["candidate_table"]) for r in manifest_records if Path(r["candidate_table"]).exists()]
+            candidate_paths = [
+                Path(record["candidate_table"])
+                for record in manifest_records
+                if Path(record["candidate_table"]).exists()
+            ]
             if candidate_paths:
                 global_candidates = pd.concat(
-                    [pd.read_csv(p, keep_default_na=False) for p in candidate_paths],
+                    [
+                        pd.read_csv(path, keep_default_na=False)
+                        for path in candidate_paths
+                    ],
                     ignore_index=True,
                     sort=False,
                 )
-                global_path = out_dir / "candidate_prioritization_table.global.csv"
+                global_path = (
+                    output / "candidate_prioritization_table.global.csv"
+                )
                 global_candidates.to_csv(global_path, index=False)
                 outputs["global_candidate_table"] = global_path
 
     manifest = {
         "parser_out": str(parser_out),
         "output_dir": str(output_dir),
-        "llm_clusters": str(llm_clusters) if llm_clusters else "",
+        "uid_algorithm": (
+            "SHA-256, first 128 bits, Base64url; "
+            "payload is normalized VH<US>VL only"
+        ),
+        "llm_integration_enabled": False,
+        "llm_clusters_argument_ignored": (
+            str(llm_clusters) if llm_clusters else ""
+        ),
         "region_specs": list(region_specs),
         "write_annotated_uid": write_annotated_uid,
         "strict_topology": strict_topology,
         "split_by_library": split_by_library,
-        "write_global_table": write_global_table,
+        "write_global_table": bool(write_global_table),
         "library_key_filter": library_key_filter or "",
         "libraries": manifest_records,
     }
-    manifest_path = out_dir / "run_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_path = output / "run_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
     outputs["manifest"] = manifest_path
 
     return outputs
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="FAO2 candidate prioritization post-processor")
-    p.add_argument("--parser-out", required=True, help="Existing FAO parser_outputs directory")
-    p.add_argument("--out", required=True, help="Output directory for prioritization outputs")
-    p.add_argument("--llm-clusters", default=None, help="Optional CSV/XLSX file with seq_uid or H_FL_PEP/L_FL_PEP and LLM cluster columns")
-    p.add_argument(
+    parser = argparse.ArgumentParser(
+        description="FAO2 candidate prioritization post-processor"
+    )
+    parser.add_argument(
+        "--parser-out",
+        required=True,
+        help="Existing FAO parser_outputs directory",
+    )
+    parser.add_argument(
+        "--out",
+        required=True,
+        help="Output directory for prioritization outputs",
+    )
+    parser.add_argument(
+        "--llm-clusters",
+        default=None,
+        help="Reserved for future use; currently ignored",
+    )
+    parser.add_argument(
         "--region-specs",
         nargs="+",
         default=DEFAULT_REGION_SPECS,
         help="Region specs to summarize",
     )
-    p.add_argument(
+    parser.add_argument(
         "--write-annotated-uid",
         action="store_true",
         help="Append seq_uid to each existing *_annotated.csv in place",
     )
-    p.add_argument(
+    parser.add_argument(
         "--no-strict-topology",
         action="store_true",
-        help="Generate seq_uid whenever H_FL_PEP exists, without scFv H/L completeness filtering",
+        help=(
+            "Generate seq_uid whenever H_FL_PEP exists, without scFv H/L "
+            "completeness filtering"
+        ),
     )
-    p.add_argument(
+    parser.add_argument(
         "--no-split-by-library",
         action="store_true",
-        help="Write one global candidate table instead of per-library output folders; this loads all samples",
+        help=(
+            "Write one global candidate table instead of per-library output; "
+            "this loads all samples"
+        ),
     )
-    p.add_argument(
+    parser.add_argument(
         "--write-global-table",
         action="store_true",
-        help="After per-library processing, concatenate candidate tables into a global table",
+        help=(
+            "After per-library processing, concatenate candidate tables "
+            "into a global table"
+        ),
     )
-    p.add_argument(
+    parser.add_argument(
         "--library-key",
         default=None,
-        help="Optional substring filter; process only libraries whose library_key contains this text",
+        help=(
+            "Optional substring filter; process only libraries whose "
+            "library_key contains this text"
+        ),
     )
-    return p
+    return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -841,6 +1162,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         write_global_table=args.write_global_table,
         library_key_filter=args.library_key,
     )
+
     print("FAO2 prioritization complete.")
     for name, path in outputs.items():
         print(f"  {name}: {path}")
