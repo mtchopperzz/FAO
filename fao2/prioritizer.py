@@ -66,28 +66,29 @@ CORE_SEQUENCE_COLUMNS = [
 ]
 
 # Reduced 11-class amino-acid alphabet agreed for similarity inspection:
-# AG / DE / FY / ILMV / KR / NQ / ST / C / H / P / W
+# DE / ILV / A / NQ / RHK / ST / C / P / G / M / F / W / Y 
+
 AA_DEGENERATION_MAP = {
+    "D": "B",
+    "E": "B",
+    "I": "J",
+    "L": "J",
+    "V": "J",
     "A": "A",
-    "G": "A",
-    "D": "D",
-    "E": "D",
-    "F": "F",
-    "Y": "F",
-    "I": "I",
-    "L": "I",
-    "M": "I",
-    "V": "I",
-    "K": "K",
-    "R": "K",
-    "N": "N",
-    "Q": "N",
-    "S": "S",
-    "T": "S",
+    "N": "O",
+    "Q": "O",
+    "R": "U",
+    "H": "U",
+    "K": "U",
+    "S": "X",
+    "T": "X",
     "C": "C",
-    "H": "H",
     "P": "P",
+    "G": "G",
+    "M": "M",
+    "F": "F",
     "W": "W",
+    "Y": "Y",
 }
 
 

@@ -30,7 +30,7 @@ except ImportError:
     run_anarci = None
     ANARCI_AVAILABLE = False
 
-from utils.ProcessHandlers import IgblastExtractor, _nb_dna_to_pep, _nb_revcom
+from utils.ProcessHandlers import IgblastExtractor, _nb_dna_to_pep
 
 
 
@@ -50,9 +50,11 @@ class ContinuousIgblastExtractor(IgblastExtractor):
     """
 
     _C_TERM_PATTERN = re.compile(
-        r"(YYC|HYC|YHC|YGC|CYC|HGC|YCC|FNC|YFC|YSC|YLC|HFC|KFC|YDC|FYC|YIC|SYC)"
+        r"(YYC|Y[CFHNWDSL]C|[HCDFIS]YC|NYC)"
         r"(.{1,30}?)"
-        r"(WG.G|FG.G|WVG|FSDG|LG.G|IG.G)"
+        r"(WGQ[GVLE]|WGR[GV]|WGK[GV]|WG[PHLE]G|"
+        r"WV(?:EG|Q[GVL])|CG(?:Q[GVL]|RG)|"
+        r"[LGRVS]GQG|FG[GQ]G|W[DSA]QG)"
         r"(.*)"
     )
 
@@ -74,6 +76,56 @@ class ContinuousIgblastExtractor(IgblastExtractor):
         self.anarci_allowed_species = config_meta.get("anarci_allowed_species", None)
         self.anarci_bit_score_threshold = float(
             config_meta.get("anarci_bit_score_threshold", 80)
+        )
+
+        self.debug_igblast = bool(config_meta.get("debug_igblast", False))
+        default_debug_dir = os.path.join(
+            getattr(self.dirs, "logs", "."),
+            "igblast_debug",
+        )
+        self.debug_igblast_dir = str(
+            config_meta.get("debug_igblast_dir", default_debug_dir)
+        )
+        self.debug_write_query_fasta = bool(
+            config_meta.get("debug_write_query_fasta", True)
+        )
+        self.debug_write_airr_tsv = bool(
+            config_meta.get("debug_write_airr_tsv", True)
+        )
+        self.debug_write_hit_table = bool(
+            config_meta.get("debug_write_hit_table", True)
+        )
+        self.debug_max_rows_per_chunk = int(
+            config_meta.get("debug_max_rows_per_chunk", 0)
+        )
+
+        if self.debug_igblast:
+            os.makedirs(self.debug_igblast_dir, exist_ok=True)
+
+    @staticmethod
+    def _debug_safe_name(value: Any) -> str:
+        text = str(value)
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_") or "sample"
+
+    def _debug_path(self, sample_name: Any, suffix: str) -> str:
+        stem = self._debug_safe_name(sample_name)
+        return os.path.join(self.debug_igblast_dir, f"{stem}{suffix}")
+
+    def _write_debug_stage_summary(
+        self,
+        sample_name: Any,
+        summary: Dict[str, Any],
+    ) -> None:
+        if not self.debug_igblast:
+            return
+        path = os.path.join(self.debug_igblast_dir, "stage_summary.csv")
+        row = {"sample_chunk": str(sample_name), **summary}
+        frame = pd.DataFrame([row])
+        frame.to_csv(
+            path,
+            mode="a",
+            header=not os.path.exists(path),
+            index=False,
         )
 
     @staticmethod
@@ -99,23 +151,20 @@ class ContinuousIgblastExtractor(IgblastExtractor):
             return bool(value)
         return str(value).strip().lower() in {"t", "true", "1", "yes", "y"}
 
-    @staticmethod
-    def _reverse_complement(dna: str) -> str:
-        """Return the reverse complement of an uppercase DNA string."""
-        dna = str(dna).upper().replace(" ", "")
-        if not dna:
-            return ""
-        arr = np.frombuffer(dna.encode("ascii"), dtype=np.uint8)
-        return _nb_revcom(arr).tobytes().decode("ascii")
 
-    @classmethod
-    def _oriented_query_sequence(cls, hit: pd.Series) -> str:
-        """Return AIRR ``sequence`` in the orientation used by AIRR coordinates."""
+    @staticmethod
+    def _oriented_query_sequence(hit: pd.Series) -> str:
+        """
+        Return the IgBLAST AIRR ``sequence`` used for coordinate-based translation.
+
+        In the current IgBLAST 1.22.0 outfmt 19 output, ``sequence`` is already
+        oriented consistently with ``sequence_alignment`` and the reported
+        FR/CDR coordinates. ``rev_comp`` is retained as QC metadata only and is
+        not applied to the sequence again.
+        """
         sequence = str(hit.get("sequence", "")).upper().replace(" ", "")
         if not sequence or sequence == "NAN":
             return ""
-        if cls._parse_airr_boolean(hit.get("rev_comp")):
-            sequence = cls._reverse_complement(sequence)
         return sequence
 
     @staticmethod
@@ -414,6 +463,8 @@ class ContinuousIgblastExtractor(IgblastExtractor):
             for sample in data:
                 new_D, new_P, new_Q = [], [], []
                 fasta_entries: List[str] = []
+                n_input_reads = len(sample.D)
+                sample_name = getattr(sample, "name", "sample")
 
                 for i, row_data in enumerate(sample.D):
                     row_bytes = (
@@ -429,10 +480,19 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                 if not fasta_entries:
                     continue
 
+                fasta_text = "\n".join(fasta_entries)
+                if self.debug_igblast and self.debug_write_query_fasta:
+                    with open(
+                        self._debug_path(sample_name, "__igblast_query.fasta"),
+                        "w",
+                        encoding="utf-8",
+                    ) as handle:
+                        handle.write(fasta_text)
+
                 with tempfile.NamedTemporaryFile(
                     mode="w", dir=self.temp_dir, suffix=".fasta", delete=False
                 ) as tmp_fasta:
-                    tmp_fasta.write("\n".join(fasta_entries))
+                    tmp_fasta.write(fasta_text)
                     fasta_path = tmp_fasta.name
 
                 env = os.environ.copy()
@@ -474,6 +534,30 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                     )
 
                 result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+                if self.debug_igblast and self.debug_write_airr_tsv:
+                    with open(
+                        self._debug_path(sample_name, "__igblast_airr.tsv"),
+                        "w",
+                        encoding="utf-8",
+                    ) as handle:
+                        handle.write(result.stdout)
+
+                    if result.stderr:
+                        with open(
+                            self._debug_path(sample_name, "__igblast_stderr.txt"),
+                            "w",
+                            encoding="utf-8",
+                        ) as handle:
+                            handle.write(result.stderr)
+
+                    with open(
+                        self._debug_path(sample_name, "__igblast_command.txt"),
+                        "w",
+                        encoding="utf-8",
+                    ) as handle:
+                        handle.write(" ".join(cmd))
+
                 os.remove(fasta_path)
 
                 if result.returncode != 0:
@@ -485,12 +569,34 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                     hits_df["orig_idx"] = hits_df["sequence_id"].apply(
                         lambda x: int(str(x).split("_")[0].replace("seq", ""))
                     )
+                    if self.debug_igblast:
+                        hits_df["hit_key"] = [
+                            f"hit{idx}" for idx in hits_df.index
+                        ]
+                        hits_df["rev_comp_parsed"] = (
+                            hits_df["rev_comp"].apply(self._parse_airr_boolean)
+                            if "rev_comp" in hits_df.columns
+                            else False
+                        )
+                        hits_df["oriented_sequence"] = hits_df.apply(
+                            self._oriented_query_sequence,
+                            axis=1,
+                        )
+                        hits_df["n_terminal_start"] = hits_df.apply(
+                            self._n_terminal_start,
+                            axis=1,
+                        )
+                        hits_df["expected_chain"] = hits_df.apply(
+                            self._expected_chain,
+                            axis=1,
+                        )
                 except Exception as exc:
                     self.logger.error(f"Parsing AIRR failed: {exc}")
                     continue
 
                 primary_candidates: List[Dict[str, Any]] = []
                 hit_rows: Dict[str, pd.Series] = {}
+                frame0_built: Dict[str, bool] = {} if self.debug_igblast else {}
 
                 for hit_index, hit in hits_df.iterrows():
                     hit_key = f"hit{hit_index}"
@@ -498,15 +604,21 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                     candidate = self._build_translation_candidate(
                         hit, f"{hit_key}_f0", frame_offset=0
                     )
+                    if self.debug_igblast:
+                        frame0_built[hit_key] = candidate is not None
                     if candidate is not None:
                         primary_candidates.append(candidate)
 
                 annotations = self._run_anarci(primary_candidates)
+                n_primary_anarci_success = len(annotations)
                 successful_hits = {
                     candidate_id.rsplit("_f", 1)[0] for candidate_id in annotations
                 }
 
                 rescue_candidates: List[Dict[str, Any]] = []
+                rescue_offsets_built: Dict[str, List[int]] = (
+                    {} if self.debug_igblast else {}
+                )
                 for hit_key, hit in hit_rows.items():
                     if hit_key in successful_hits:
                         continue
@@ -518,9 +630,108 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                         )
                         if candidate is not None:
                             rescue_candidates.append(candidate)
+                            if self.debug_igblast:
+                                rescue_offsets_built.setdefault(
+                                    hit_key, []
+                                ).append(int(offset))
 
-                annotations.update(self._run_anarci(rescue_candidates))
+                rescue_annotations = self._run_anarci(rescue_candidates)
+                annotations.update(rescue_annotations)
                 selected = self._best_by_read_and_chain(annotations.values())
+
+                if self.debug_igblast and self.debug_write_hit_table:
+                    primary_success_hits = {
+                        candidate_id.rsplit("_f", 1)[0]
+                        for candidate_id in annotations
+                        if candidate_id.endswith("_f0")
+                    }
+                    rescue_success_hits = {
+                        candidate_id.rsplit("_f", 1)[0]
+                        for candidate_id in rescue_annotations
+                    }
+                    selected_candidate_ids = {
+                        item["candidate_id"] for item in selected.values()
+                    }
+                    selected_hits = {
+                        candidate_id.rsplit("_f", 1)[0]
+                        for candidate_id in selected_candidate_ids
+                    }
+
+                    debug_hits = hits_df.copy()
+                    debug_hits["frame0_candidate_built"] = debug_hits[
+                        "hit_key"
+                    ].map(frame0_built).fillna(False)
+                    debug_hits["frame0_anarci_success"] = debug_hits[
+                        "hit_key"
+                    ].isin(primary_success_hits)
+                    debug_hits["rescue_offsets_built"] = debug_hits[
+                        "hit_key"
+                    ].map(
+                        lambda key: ",".join(
+                            str(x) for x in rescue_offsets_built.get(key, [])
+                        )
+                    )
+                    debug_hits["rescue_anarci_success"] = debug_hits[
+                        "hit_key"
+                    ].isin(rescue_success_hits)
+                    debug_hits["selected_for_output"] = debug_hits[
+                        "hit_key"
+                    ].isin(selected_hits)
+
+                    preferred_columns = [
+                        "hit_key",
+                        "sequence_id",
+                        "orig_idx",
+                        "sequence",
+                        "rev_comp",
+                        "rev_comp_parsed",
+                        "oriented_sequence",
+                        "locus",
+                        "expected_chain",
+                        "productive",
+                        "vj_in_frame",
+                        "stop_codon",
+                        "v_call",
+                        "d_call",
+                        "j_call",
+                        "fwr1_start",
+                        "v_germline_start",
+                        "fwr4_start",
+                        "fwr4_end",
+                        "sequence_aa",
+                        "sequence_alignment",
+                        "sequence_alignment_aa",
+                        "n_terminal_start",
+                        "frame0_candidate_built",
+                        "frame0_anarci_success",
+                        "rescue_offsets_built",
+                        "rescue_anarci_success",
+                        "selected_for_output",
+                    ]
+                    preferred_columns = [
+                        column
+                        for column in preferred_columns
+                        if column in debug_hits.columns
+                    ]
+                    remaining_columns = [
+                        column
+                        for column in debug_hits.columns
+                        if column not in preferred_columns
+                    ]
+                    debug_hits = debug_hits[
+                        preferred_columns + remaining_columns
+                    ]
+                    if self.debug_max_rows_per_chunk > 0:
+                        debug_hits = debug_hits.head(
+                            self.debug_max_rows_per_chunk
+                        )
+                    debug_hits.to_csv(
+                        self._debug_path(
+                            sample_name,
+                            "__igblast_hits_debug.csv",
+                        ),
+                        index=False,
+                    )
 
                 for i in range(len(sample.D)):
                     h_ann = selected.get((i, "H"))
@@ -581,6 +792,43 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                     new_D.append(dna_str)
                     if sample.Q is not None:
                         new_Q.append(sample.Q[i])
+
+                if self.debug_igblast:
+                    self._write_debug_stage_summary(
+                        sample_name,
+                        {
+                            "input_reads": n_input_reads,
+                            "igblast_query_fragments": len(fasta_entries),
+                            "igblast_hit_rows": len(hits_df),
+                            "igblast_rev_comp_hits": int(
+                                hits_df["rev_comp_parsed"].sum()
+                            ),
+                            "igblast_hits_with_chain": int(
+                                hits_df["expected_chain"].notna().sum()
+                            ),
+                            "igblast_hits_with_fwr1": int(
+                                pd.to_numeric(
+                                    hits_df.get("fwr1_start"),
+                                    errors="coerce",
+                                ).notna().sum()
+                            ),
+                            "igblast_hits_with_fwr4": int(
+                                pd.to_numeric(
+                                    hits_df.get("fwr4_end"),
+                                    errors="coerce",
+                                ).notna().sum()
+                            ),
+                            "frame0_candidates_built": len(primary_candidates),
+                            "frame0_anarci_success": n_primary_anarci_success,
+                            "rescue_candidates_built": len(rescue_candidates),
+                            "rescue_anarci_success": len(rescue_annotations),
+                            "selected_chains": len(selected),
+                            "selected_reads": len(
+                                {item["orig_idx"] for item in selected.values()}
+                            ),
+                            "output_rows": len(new_P),
+                        },
+                    )
 
                 sample.D = np.array(new_D, dtype=object)
                 sample.P = np.array(new_P, dtype=object)

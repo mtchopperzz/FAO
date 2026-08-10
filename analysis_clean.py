@@ -11,10 +11,10 @@ from utils.ProcessHandlers import Logger, DirectoryTracker
 from utils.ContinuousIgblastExtractor import ContinuousIgblastExtractor
 from fao2.prioritizer import run_prioritization
 
-SEQ_DATA_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input'
-LOGS_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input/logs'
-PARSER_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input/parser_outputs'
-PRIORITIZATION_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260423_HA_Specifica_VHH_phage/input/prioritization_outputs/'
+SEQ_DATA_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/input'
+LOGS_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test/logs'
+PARSER_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test/parser_outputs'
+PRIORITIZATION_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test/prioritization_outputs/'
 DELETE_INTERMEDIATE_CHUNKS = True
 
 
@@ -38,7 +38,8 @@ class Config:
         database_dir = '/home/zhao/NGS/ncbi-igblast-1.22.0/database'
         species = 'human'
 
-        linker_seq = 'TCCGGAGGGTCGACCATAACTTCGTATAATGTATACTATACGAAGTTATCCTCGAGCGGTACC'
+        linker_seq = 'TCCGGAGGGTCGACCATAACTTCGTATAATGTATACTATACGAAGTTATCCTCGAGCGGTACC' #Specifica
+        #linker_seq = 'GGAAGTACAAGCGGTTCTGGTAAACCAGGGTCAGGAGAAGGTTCCACTAAGGGC' #Whitlow
         linker_tol_ratio = 0.1
         extract_regions = ['CDR3', 'CDRs', 'FL']
 
@@ -48,6 +49,14 @@ class Config:
         frame_rescue_offsets = (0, 1, 2)
         anarci_allowed_species = None
         anarci_bit_score_threshold = 80
+
+        # Handlers for translation debug
+        debug_igblast = False
+        debug_igblast_dir = os.path.join(LOGS_PATH, "igblast_debug")
+        debug_write_query_fasta = True
+        debug_write_airr_tsv = True
+        debug_write_hit_table = True
+        debug_max_rows_per_chunk = 0
 
     class FilterConfig:
         len_range = [200, 1200]
@@ -89,7 +98,7 @@ class Config:
 
         write_global_table = None
 
-        library_key_filter = "CD161_8B_yeast__lib-scFv"
+        library_key_filter = None
 
 class LocalDispatcher:
     def __init__(self, config_obj):
@@ -124,23 +133,112 @@ class LocalDispatcher:
 
             elif h_cls == ContinuousIgblastExtractor:
                 p_conf = self.cfg.ParserConfig
+
                 meta = {
                     'dirs': shared_dirs,
                     'logger': shared_logger,
-                    'igblast_exec': getattr(p_conf, 'igblast_exec', 'igblastn'),
-                    'igdata_path': getattr(p_conf, 'igdata_path', ''),
-                    'database_dir': getattr(p_conf, 'database_dir', ''),
-                    'species': getattr(p_conf, 'species', 'human'),
-                    'linker_seq': getattr(p_conf, 'linker_seq', ''),
-                    'linker_tol_ratio': getattr(p_conf, 'linker_tol_ratio', 0.1),
-                    'extract_regions': getattr(p_conf, 'extract_regions', ['FL', 'CDR3', 'CDRs']),
-                    'igblast_ncpu': getattr(p_conf, 'igblast_ncpu', multiprocessing.cpu_count()),
-                    'anarci_ncpu': getattr(p_conf, 'anarci_ncpu', max(1, multiprocessing.cpu_count() - 16)),
-                    'anarci_batch_size': getattr(p_conf, 'anarci_batch_size', 5000),
-                    'frame_rescue_offsets': getattr(p_conf, 'frame_rescue_offsets', (0, 1, 2)),
-                    'anarci_allowed_species': getattr(p_conf, 'anarci_allowed_species', None),
-                    'anarci_bit_score_threshold': getattr(p_conf, 'anarci_bit_score_threshold', 80),
+
+                    'igblast_exec': getattr(
+                        p_conf,
+                        'igblast_exec',
+                        'igblastn',
+                    ),
+                    'igdata_path': getattr(
+                        p_conf,
+                        'igdata_path',
+                        '',
+                    ),
+                    'database_dir': getattr(
+                        p_conf,
+                        'database_dir',
+                        '',
+                    ),
+                    'species': getattr(
+                        p_conf,
+                        'species',
+                        'human',
+                    ),
+
+                    'linker_seq': getattr(
+                        p_conf,
+                        'linker_seq',
+                        '',
+                    ),
+                    'linker_tol_ratio': getattr(
+                        p_conf,
+                        'linker_tol_ratio',
+                        0.1,
+                    ),
+                    'extract_regions': getattr(
+                        p_conf,
+                        'extract_regions',
+                        ['FL', 'CDR3', 'CDRs'],
+                    ),
+
+                    'igblast_ncpu': getattr(
+                        p_conf,
+                        'igblast_ncpu',
+                        multiprocessing.cpu_count(),
+                    ),
+                    'anarci_ncpu': getattr(
+                        p_conf,
+                        'anarci_ncpu',
+                        max(1, multiprocessing.cpu_count() - 16),
+                    ),
+                    'anarci_batch_size': getattr(
+                        p_conf,
+                        'anarci_batch_size',
+                        5000,
+                    ),
+                    'frame_rescue_offsets': getattr(
+                        p_conf,
+                        'frame_rescue_offsets',
+                        (0, 1, 2),
+                    ),
+                    'anarci_allowed_species': getattr(
+                        p_conf,
+                        'anarci_allowed_species',
+                        None,
+                    ),
+                    'anarci_bit_score_threshold': getattr(
+                        p_conf,
+                        'anarci_bit_score_threshold',
+                        80,
+                    ),
+
+                    # IgBLAST debug output
+                    'debug_igblast': getattr(
+                        p_conf,
+                        'debug_igblast',
+                        False,
+                    ),
+                    'debug_igblast_dir': getattr(
+                        p_conf,
+                        'debug_igblast_dir',
+                        os.path.join(LOGS_PATH, 'igblast_debug'),
+                    ),
+                    'debug_write_query_fasta': getattr(
+                        p_conf,
+                        'debug_write_query_fasta',
+                        True,
+                    ),
+                    'debug_write_airr_tsv': getattr(
+                        p_conf,
+                        'debug_write_airr_tsv',
+                        True,
+                    ),
+                    'debug_write_hit_table': getattr(
+                        p_conf,
+                        'debug_write_hit_table',
+                        True,
+                    ),
+                    'debug_max_rows_per_chunk': getattr(
+                        p_conf,
+                        'debug_max_rows_per_chunk',
+                        5000,
+                    ),
                 }
+
                 inst = ContinuousIgblastExtractor(meta)
                 instances.append(inst)
 
@@ -194,7 +292,7 @@ if __name__ == '__main__':
         power=Config.AnalysisConfig.enrichment_power,
         retention_power=Config.AnalysisConfig.retention_power,
     )
-    """
+    
     # --- PHASE 5: Candidate Prioritization ---
     if Config.PrioritizationConfig.enabled:
         print('Starting Candidate Prioritization...')
@@ -213,5 +311,5 @@ if __name__ == '__main__':
     
         for output_name, output_path in prioritization_outputs.items():
             print(f'  {output_name}: {output_path}')
-    """
+    
     print('Pipeline Complete.')
