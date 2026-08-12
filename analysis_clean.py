@@ -53,6 +53,8 @@ class Config:
         #Handlers for topology-collapsed sequence filter
         require_anarci_cdr3 = True
         min_anarci_fr4_residues = 1
+        deduplicate_anarci_inputs = True
+
 
         # Handlers for translation debug
         debug_igblast = False
@@ -219,6 +221,11 @@ class LocalDispatcher:
                         p_conf,
                         'min_anarci_fr4_residues',
                         1,
+                    ),
+                    'deduplicate_anarci_inputs': getattr(
+                        p_conf,
+                        'deduplicate_anarci_inputs',
+                        True,
                     ),
 
                     # IgBLAST debug output
