@@ -6,6 +6,7 @@ boundaries. Antibody peptide sequences are translated continuously from the
 IgBLAST-defined N terminus and annotated with ANARCI/IMGT.
 """
 
+import glob
 import multiprocessing
 import os
 import re
@@ -83,6 +84,9 @@ class ContinuousIgblastExtractor(IgblastExtractor):
         self.min_anarci_fr4_residues = max(
             0,
             int(config_meta.get("min_anarci_fr4_residues", 1)),
+        )
+        self.deduplicate_anarci_inputs = bool(
+            config_meta.get("deduplicate_anarci_inputs", True)
         )
 
         self.debug_igblast = bool(config_meta.get("debug_igblast", False))
@@ -426,16 +430,60 @@ class ContinuousIgblastExtractor(IgblastExtractor):
 
         return best
 
-    def _run_anarci(self, candidates: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def _run_anarci(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+        """Run ANARCI once per unique ``(expected_chain, peptide)`` pair.
+
+        ANARCI/HMMER work is shared across duplicate read candidates. The raw
+        numbering result is then parsed against every original candidate so
+        that read index, DNA, frame, germline calls and downstream pairing are
+        preserved.
+        """
         results: Dict[str, Dict[str, Any]] = {}
+        stats = {
+            "input_candidates": len(candidates),
+            "unique_inputs": 0,
+            "deduplicated_candidates": 0,
+        }
         if not candidates:
-            return results
+            return results, stats
 
-        for batch_start in range(0, len(candidates), self.anarci_batch_size):
-            batch = list(candidates[batch_start : batch_start + self.anarci_batch_size])
-            sequences = [(c["candidate_id"], c["peptide"]) for c in batch]
+        grouped: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+        for candidate in candidates:
+            expected_chain = str(candidate.get("expected_chain", ""))
+            peptide = str(candidate.get("peptide", ""))
 
-            raw_results: Dict[str, Tuple[Any, Any]] = {}
+            if self.deduplicate_anarci_inputs:
+                key: Tuple[str, ...] = (expected_chain, peptide)
+            else:
+                key = (
+                    str(candidate.get("candidate_id", "")),
+                    expected_chain,
+                    peptide,
+                )
+
+            grouped.setdefault(key, []).append(candidate)
+
+        unique_items = list(grouped.items())
+        stats["unique_inputs"] = len(unique_items)
+        stats["deduplicated_candidates"] = len(candidates) - len(unique_items)
+
+        for batch_start in range(0, len(unique_items), self.anarci_batch_size):
+            batch_items = unique_items[
+                batch_start : batch_start + self.anarci_batch_size
+            ]
+
+            sequences: List[Tuple[str, str]] = []
+            unique_id_to_candidates: Dict[str, List[Dict[str, Any]]] = {}
+
+            for local_index, (key, candidate_group) in enumerate(batch_items):
+                unique_id = f"anarci_unique_{batch_start + local_index}"
+                peptide = key[-1]
+                sequences.append((unique_id, peptide))
+                unique_id_to_candidates[unique_id] = candidate_group
+
             if run_anarci is not None:
                 _, numbering, alignment_details, _ = run_anarci(
                     sequences,
@@ -452,30 +500,33 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                     sequences,
                     scheme="imgt",
                     output=False,
-                    ncpu=self.anarci_ncpu,
+                    ncpu=min(self.anarci_ncpu, len(sequences)),
                     assign_germline=False,
                     allowed_species=self.anarci_allowed_species,
                     allow={"H", "K", "L"},
                     bit_score_threshold=self.anarci_bit_score_threshold,
                 )
 
-            for idx, (sequence_id, _) in enumerate(sequences):
-                raw_results[sequence_id] = (
-                    numbering[idx] if numbering is not None else None,
-                    alignment_details[idx] if alignment_details is not None else None,
+            for index, (unique_id, _) in enumerate(sequences):
+                numbering_entry = (
+                    numbering[index] if numbering is not None else None
+                )
+                alignment_entry = (
+                    alignment_details[index]
+                    if alignment_details is not None
+                    else None
                 )
 
-            for candidate in batch:
-                numbering_entry, alignment_entry = raw_results.get(
-                    candidate["candidate_id"], (None, None)
-                )
-                parsed = self._parse_anarci_result(
-                    candidate, numbering_entry, alignment_entry
-                )
-                if parsed is not None:
-                    results[candidate["candidate_id"]] = parsed
+                for candidate in unique_id_to_candidates[unique_id]:
+                    parsed = self._parse_anarci_result(
+                        candidate,
+                        numbering_entry,
+                        alignment_entry,
+                    )
+                    if parsed is not None:
+                        results[candidate["candidate_id"]] = parsed
 
-        return results
+        return results, stats
 
     @staticmethod
     def _best_by_read_and_chain(
@@ -650,7 +701,9 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                     if candidate is not None:
                         primary_candidates.append(candidate)
 
-                annotations = self._run_anarci(primary_candidates)
+                annotations, primary_anarci_stats = self._run_anarci(
+                    primary_candidates
+                )
                 n_primary_anarci_success = len(annotations)
                 successful_hits = {
                     candidate_id.rsplit("_f", 1)[0] for candidate_id in annotations
@@ -676,7 +729,9 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                                     hit_key, []
                                 ).append(int(offset))
 
-                rescue_annotations = self._run_anarci(rescue_candidates)
+                rescue_annotations, rescue_anarci_stats = self._run_anarci(
+                    rescue_candidates
+                )
                 annotations.update(rescue_annotations)
                 selected = self._best_by_read_and_chain(annotations.values())
 
@@ -863,23 +918,30 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                         lp = l_data.get(f"L_{reg}_PEP", "")
                         pep_parts.append(f"H_{reg}:{hp}|L_{reg}:{lp}")
 
-                    meta_parts: List[str] = []
+                    # Count identity is peptide-only. IgBLAST germline/species
+                    # annotations are stored with the representative DNA payload
+                    # and therefore do not split otherwise identical sequences.
+                    annotation_parts: List[str] = []
                     if h_ann is not None:
-                        meta_parts.append(
-                            f"H_V_Gene:{h_data['V_Gene']}|H_J_Gene:{h_data['J_Gene']}|H_Species:{h_data['Species']}"
+                        annotation_parts.append(
+                            f"H_V_Gene:{h_data['V_Gene']}|"
+                            f"H_J_Gene:{h_data['J_Gene']}|"
+                            f"H_Species:{h_data['Species']}"
                         )
                     if l_ann is not None:
-                        meta_parts.append(
-                            f"L_V_Gene:{l_data['V_Gene']}|L_J_Gene:{l_data['J_Gene']}|L_Species:{l_data['Species']}"
+                        annotation_parts.append(
+                            f"L_V_Gene:{l_data['V_Gene']}|"
+                            f"L_J_Gene:{l_data['J_Gene']}|"
+                            f"L_Species:{l_data['Species']}"
                         )
 
                     full_pep_str = "||".join(pep_parts)
-                    if meta_parts:
-                        full_pep_str += "||" + "||".join(meta_parts)
 
                     hd = h_data.get("H_FL_DNA", "")
                     ld = l_data.get("L_FL_DNA", "")
-                    dna_str = f"H_FL:{hd}|L_FL:{ld}"
+                    companion_parts = [f"H_FL:{hd}|L_FL:{ld}"]
+                    companion_parts.extend(annotation_parts)
+                    dna_str = "||".join(companion_parts)
 
                     new_P.append(full_pep_str)
                     new_D.append(dna_str)
@@ -912,8 +974,24 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                                 ).notna().sum()
                             ),
                             "frame0_candidates_built": len(primary_candidates),
+                            "frame0_anarci_unique_inputs": primary_anarci_stats[
+                                "unique_inputs"
+                            ],
+                            "frame0_anarci_deduplicated_candidates": (
+                                primary_anarci_stats[
+                                    "deduplicated_candidates"
+                                ]
+                            ),
                             "frame0_anarci_success": n_primary_anarci_success,
                             "rescue_candidates_built": len(rescue_candidates),
+                            "rescue_anarci_unique_inputs": rescue_anarci_stats[
+                                "unique_inputs"
+                            ],
+                            "rescue_anarci_deduplicated_candidates": (
+                                rescue_anarci_stats[
+                                    "deduplicated_candidates"
+                                ]
+                            ),
                             "rescue_anarci_success": len(rescue_annotations),
                             "selected_chains": len(selected),
                             "selected_reads": len(
@@ -952,3 +1030,109 @@ class ContinuousIgblastExtractor(IgblastExtractor):
 
         _op.__name__ = "run_igblast_continuous_anarci"
         return _op
+
+    def format_for_downstream(self):
+        """Write the established annotated.csv schema.
+
+        New parser outputs keep peptide regions in ``Seq`` and keep one
+        representative DNA plus IgBLAST V/J/species annotations in the
+        companion ``DNA`` payload. Older outputs with metadata embedded in
+        ``Seq`` remain readable.
+        """
+        search_pattern = os.path.join(
+            self.dirs.parser_out,
+            "*",
+            "*_pep_counts.csv",
+        )
+        merged_files = glob.glob(search_pattern)
+
+        exact_columns = [
+            "ID",
+            "H_CDR3_PEP",
+            "H_CDRs_PEP",
+            "H_FL_PEP",
+            "L_CDRs_PEP",
+            "L_FL_PEP",
+            "L_CDR3_PEP",
+            "H_V_Gene",
+            "H_J_Gene",
+            "H_Species",
+            "L_V_Gene",
+            "L_Species",
+            "L_J_Gene",
+            "Count",
+            "H_FL_DNA",
+            "L_FL_DNA",
+        ]
+
+        for file_path in merged_files:
+            try:
+                df = pd.read_csv(file_path, keep_default_na=False)
+            except Exception as exc:
+                self.logger.warning(
+                    f"Could not read merged count file {file_path}: {exc}"
+                )
+                continue
+
+            if "Seq" not in df.columns:
+                continue
+
+            records: List[Dict[str, Any]] = []
+
+            for _, row in df.iterrows():
+                record: Dict[str, Any] = {
+                    "Count": row.get("Count", 0),
+                }
+
+                # Peptide regions. This also keeps backward compatibility with
+                # older files where IgBLAST metadata was embedded in Seq.
+                for packed_region in str(row.get("Seq", "")).split("||"):
+                    for chain_part in packed_region.split("|"):
+                        if ":" not in chain_part:
+                            continue
+                        key, value = chain_part.split(":", 1)
+                        if key.endswith("_Gene") or key.endswith("_Species"):
+                            record[key] = value
+                        else:
+                            record[f"{key}_PEP"] = value
+
+                # Representative DNA and current-format IgBLAST annotations.
+                for packed_item in str(row.get("DNA", "")).split("||"):
+                    for chain_part in packed_item.split("|"):
+                        if ":" not in chain_part:
+                            continue
+                        key, value = chain_part.split(":", 1)
+                        if key.endswith("_Gene") or key.endswith("_Species"):
+                            record[key] = value
+                        else:
+                            record[f"{key}_DNA"] = value
+
+                records.append(record)
+
+            new_df = pd.DataFrame(records)
+            base = os.path.basename(file_path).replace(
+                "_pep_counts.csv",
+                "",
+            )
+            new_df.insert(
+                0,
+                "ID",
+                [
+                    f"{base}_{index:06d}"
+                    for index in range(1, len(new_df) + 1)
+                ],
+            )
+
+            for column in exact_columns:
+                if column not in new_df.columns:
+                    new_df[column] = ""
+
+            new_df = new_df[exact_columns]
+            output_path = file_path.replace(
+                "_pep_counts.csv",
+                "_pep_counts_annotated.csv",
+            )
+            new_df.to_csv(output_path, index=False)
+            self.logger.info(
+                f"Formatted for downstream analysis: {output_path}"
+            )
