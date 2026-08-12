@@ -6,7 +6,6 @@ boundaries. Antibody peptide sequences are translated continuously from the
 IgBLAST-defined N terminus and annotated with ANARCI/IMGT.
 """
 
-import math
 import multiprocessing
 import os
 import re
@@ -39,6 +38,7 @@ IMGT_REGION_RANGES = {
     "CDR1": (27, 38),
     "CDR2": (56, 65),
     "CDR3": (105, 117),
+    "FR4": (118, 128),
 }
 
 
@@ -76,6 +76,13 @@ class ContinuousIgblastExtractor(IgblastExtractor):
         self.anarci_allowed_species = config_meta.get("anarci_allowed_species", None)
         self.anarci_bit_score_threshold = float(
             config_meta.get("anarci_bit_score_threshold", 80)
+        )
+        self.require_anarci_cdr3 = bool(
+            config_meta.get("require_anarci_cdr3", True)
+        )
+        self.min_anarci_fr4_residues = max(
+            0,
+            int(config_meta.get("min_anarci_fr4_residues", 1)),
         )
 
         self.debug_igblast = bool(config_meta.get("debug_igblast", False))
@@ -213,6 +220,12 @@ class ContinuousIgblastExtractor(IgblastExtractor):
         candidate_id: str,
         frame_offset: int,
     ) -> Optional[Dict[str, Any]]:
+        """Build an untrimmed protein candidate for ANARCI.
+
+        IgBLAST FR4 coordinates and the empirical C-terminal motif are retained
+        as hints only. Neither is required and neither is used to trim the
+        candidate before ANARCI. ANARCI determines the final domain boundaries.
+        """
         raw_seq = self._oriented_query_sequence(hit)
         if not raw_seq:
             return None
@@ -226,34 +239,29 @@ class ContinuousIgblastExtractor(IgblastExtractor):
         if start >= len(raw_seq):
             return None
 
+        dna = raw_seq[start:]
+        dna = dna[: len(dna) - (len(dna) % 3)]
+        peptide = self._translate(dna)
+
+        # A stop after the antibody domain is a natural boundary for the input
+        # candidate. A stop before CDR3/FR4 will cause ANARCI/post-ANARCI gates
+        # to reject the incomplete domain.
+        if "*" in peptide:
+            peptide = peptide.split("*", 1)[0]
+            dna = dna[: len(peptide) * 3]
+
+        if not peptide or len(peptide) < 70:
+            return None
+
         fwr4_end = self._safe_int(hit.get("fwr4_end"))
-        c_end_method = "igblast_fwr4"
+        motif_rescue_end = self._rescue_c_terminal_end(peptide)
 
         if fwr4_end is not None and fwr4_end > start:
-            approximate_end = min(len(raw_seq), fwr4_end)
-            span = approximate_end - start
-            aligned_span = int(math.ceil(span / 3.0) * 3)
-            end = min(len(raw_seq), start + aligned_span)
-            dna = raw_seq[start:end]
-            dna = dna[: len(dna) - (len(dna) % 3)]
-            peptide = self._translate(dna)
+            c_end_method = "igblast_fwr4_hint_untrimmed"
+        elif motif_rescue_end is not None:
+            c_end_method = "sequence_motif_hint_untrimmed"
         else:
-            dna = raw_seq[start:]
-            dna = dna[: len(dna) - (len(dna) % 3)]
-            peptide = self._translate(dna)
-            if "*" in peptide:
-                peptide = peptide.split("*", 1)[0]
-                dna = dna[: len(peptide) * 3]
-
-            rescued_end = self._rescue_c_terminal_end(peptide)
-            if rescued_end is None:
-                return None
-            peptide = peptide[:rescued_end]
-            dna = dna[: rescued_end * 3]
-            c_end_method = "sequence_rescue"
-
-        if not peptide or "*" in peptide or len(peptide) < 70:
-            return None
+            c_end_method = "anarci_untrimmed_no_c_terminal_hint"
 
         return {
             "candidate_id": candidate_id,
@@ -269,6 +277,8 @@ class ContinuousIgblastExtractor(IgblastExtractor):
             if pd.notna(hit.get("j_call"))
             else "",
             "c_end_method": c_end_method,
+            "igblast_fwr4_end": fwr4_end,
+            "motif_rescue_end": motif_rescue_end,
         }
 
     @staticmethod
@@ -306,6 +316,23 @@ class ContinuousIgblastExtractor(IgblastExtractor):
             if start <= position <= end and aa != "-":
                 chars.append(aa)
         return "".join(chars)
+
+    @staticmethod
+    def _numbered_position_bounds(
+        residues: Sequence[Any],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        positions: List[int] = []
+        for entry in residues:
+            try:
+                position = int(entry[0][0])
+                aa = str(entry[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if aa != "-":
+                positions.append(position)
+        if not positions:
+            return None, None
+        return min(positions), max(positions)
 
     @staticmethod
     def _find_domain_start(peptide: str, numbered_seq: str, start_hint: Optional[int]) -> Optional[int]:
@@ -359,9 +386,14 @@ class ContinuousIgblastExtractor(IgblastExtractor):
             cdr1 = self._numbered_region(residues, *IMGT_REGION_RANGES["CDR1"])
             cdr2 = self._numbered_region(residues, *IMGT_REGION_RANGES["CDR2"])
             cdr3 = self._numbered_region(residues, *IMGT_REGION_RANGES["CDR3"])
-            if not cdr3:
+            fr4 = self._numbered_region(residues, *IMGT_REGION_RANGES["FR4"])
+
+            if self.require_anarci_cdr3 and not cdr3:
+                continue
+            if len(fr4) < self.min_anarci_fr4_residues:
                 continue
 
+            first_imgt, last_imgt = self._numbered_position_bounds(residues)
             bitscore = float(meta.get("bitscore", 0.0) or 0.0)
             completeness = len(numbered_seq)
             parsed = {
@@ -370,16 +402,23 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                 "FL_DNA": coding_dna,
                 "CDR3_PEP": cdr3,
                 "CDRs_PEP": cdr1 + cdr2 + cdr3,
+                "FR4_PEP": fr4,
                 "anarci_bitscore": bitscore,
                 "anarci_completeness": completeness,
+                "anarci_first_imgt_position": first_imgt,
+                "anarci_last_imgt_position": last_imgt,
+                "anarci_fr4_length": len(fr4),
+                "anarci_fr4_complete": len(fr4) == 11,
             }
 
             if best is None or (
                 parsed["anarci_bitscore"],
+                parsed["anarci_fr4_length"],
                 parsed["anarci_completeness"],
                 -parsed["frame_offset"],
             ) > (
                 best["anarci_bitscore"],
+                best["anarci_fr4_length"],
                 best["anarci_completeness"],
                 -best["frame_offset"],
             ):
@@ -448,10 +487,12 @@ class ContinuousIgblastExtractor(IgblastExtractor):
             old = selected.get(key)
             if old is None or (
                 item["anarci_bitscore"],
+                item.get("anarci_fr4_length", 0),
                 item["anarci_completeness"],
                 -item["frame_offset"],
             ) > (
                 old["anarci_bitscore"],
+                old.get("anarci_fr4_length", 0),
                 old["anarci_completeness"],
                 -old["frame_offset"],
             ):
@@ -656,6 +697,10 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                         candidate_id.rsplit("_f", 1)[0]
                         for candidate_id in selected_candidate_ids
                     }
+                    selected_by_hit = {
+                        item["candidate_id"].rsplit("_f", 1)[0]: item
+                        for item in selected.values()
+                    }
 
                     debug_hits = hits_df.copy()
                     debug_hits["frame0_candidate_built"] = debug_hits[
@@ -677,6 +722,48 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                     debug_hits["selected_for_output"] = debug_hits[
                         "hit_key"
                     ].isin(selected_hits)
+                    debug_hits["selected_frame_offset"] = debug_hits[
+                        "hit_key"
+                    ].map(
+                        lambda key: selected_by_hit.get(key, {}).get(
+                            "frame_offset", ""
+                        )
+                    )
+                    debug_hits["selected_c_end_method"] = debug_hits[
+                        "hit_key"
+                    ].map(
+                        lambda key: selected_by_hit.get(key, {}).get(
+                            "c_end_method", ""
+                        )
+                    )
+                    debug_hits["selected_anarci_bitscore"] = debug_hits[
+                        "hit_key"
+                    ].map(
+                        lambda key: selected_by_hit.get(key, {}).get(
+                            "anarci_bitscore", ""
+                        )
+                    )
+                    debug_hits["selected_anarci_last_imgt_position"] = debug_hits[
+                        "hit_key"
+                    ].map(
+                        lambda key: selected_by_hit.get(key, {}).get(
+                            "anarci_last_imgt_position", ""
+                        )
+                    )
+                    debug_hits["selected_anarci_fr4_length"] = debug_hits[
+                        "hit_key"
+                    ].map(
+                        lambda key: selected_by_hit.get(key, {}).get(
+                            "anarci_fr4_length", ""
+                        )
+                    )
+                    debug_hits["selected_anarci_fr4_complete"] = debug_hits[
+                        "hit_key"
+                    ].map(
+                        lambda key: selected_by_hit.get(key, {}).get(
+                            "anarci_fr4_complete", ""
+                        )
+                    )
 
                     preferred_columns = [
                         "hit_key",
@@ -707,6 +794,12 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                         "rescue_offsets_built",
                         "rescue_anarci_success",
                         "selected_for_output",
+                        "selected_frame_offset",
+                        "selected_c_end_method",
+                        "selected_anarci_bitscore",
+                        "selected_anarci_last_imgt_position",
+                        "selected_anarci_fr4_length",
+                        "selected_anarci_fr4_complete",
                     ]
                     preferred_columns = [
                         column
@@ -825,6 +918,25 @@ class ContinuousIgblastExtractor(IgblastExtractor):
                             "selected_chains": len(selected),
                             "selected_reads": len(
                                 {item["orig_idx"] for item in selected.values()}
+                            ),
+                            "selected_igblast_fwr4_hint": sum(
+                                item.get("c_end_method")
+                                == "igblast_fwr4_hint_untrimmed"
+                                for item in selected.values()
+                            ),
+                            "selected_sequence_motif_hint": sum(
+                                item.get("c_end_method")
+                                == "sequence_motif_hint_untrimmed"
+                                for item in selected.values()
+                            ),
+                            "selected_no_c_terminal_hint": sum(
+                                item.get("c_end_method")
+                                == "anarci_untrimmed_no_c_terminal_hint"
+                                for item in selected.values()
+                            ),
+                            "selected_complete_fr4": sum(
+                                bool(item.get("anarci_fr4_complete", False))
+                                for item in selected.values()
                             ),
                             "output_rows": len(new_P),
                         },
