@@ -12,9 +12,9 @@ from utils.ContinuousIgblastExtractor import ContinuousIgblastExtractor
 from fao2.prioritizer import run_prioritization
 
 SEQ_DATA_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/input'
-LOGS_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test/logs'
-PARSER_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test/parser_outputs'
-PRIORITIZATION_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test/prioritization_outputs/'
+LOGS_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test2/logs'
+PARSER_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test2/parser_outputs'
+PRIORITIZATION_OUT_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/FAO2_test2/prioritization_outputs/'
 DELETE_INTERMEDIATE_CHUNKS = True
 
 
@@ -49,6 +49,10 @@ class Config:
         frame_rescue_offsets = (0, 1, 2)
         anarci_allowed_species = None
         anarci_bit_score_threshold = 80
+
+        #Handlers for topology-collapsed sequence filter
+        require_anarci_cdr3 = True
+        min_anarci_fr4_residues = 1
 
         # Handlers for translation debug
         debug_igblast = False
@@ -204,6 +208,17 @@ class LocalDispatcher:
                         p_conf,
                         'anarci_bit_score_threshold',
                         80,
+                    ),
+                    #Topology-collapsed sequence filter
+                    'require_anarci_cdr3': getattr(
+                        p_conf,
+                        'require_anarci_cdr3',
+                        True,
+                    ),
+                    'min_anarci_fr4_residues': getattr(
+                        p_conf,
+                        'min_anarci_fr4_residues',
+                        1,
                     ),
 
                     # IgBLAST debug output
