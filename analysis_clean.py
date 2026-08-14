@@ -6,9 +6,9 @@ Continuous-frame translation + parallel ANARCI annotation version.
 
 import os
 import multiprocessing
-from utils.ProcessHandlers import Pipeline, FastqParser, EnrichmentAnalyzer
-from utils.ProcessHandlers import Logger, DirectoryTracker
-from utils.ContinuousIgblastExtractor import ContinuousIgblastExtractor
+from fao2.ProcessHandlers import Pipeline, FastqParser, EnrichmentAnalyzer
+from fao2.ProcessHandlers import Logger, DirectoryTracker
+from fao2.ContinuousIgblastExtractor import ContinuousIgblastExtractor
 from fao2.prioritizer import run_prioritization
 
 SEQ_DATA_PATH = '/home/zhao/data/DDB_NGS_archive/Display_Screening/Yeast/20260619_CD161_Specifica/input'
@@ -105,6 +105,15 @@ class Config:
         write_global_table = None
 
         library_key_filter = None
+
+
+        liability_screening = True
+
+        liability_ncpu = 64
+
+        liability_batch_size = 5000
+
+        liability_bit_score_threshold = 80.0
 
 class LocalDispatcher:
     def __init__(self, config_obj):
@@ -329,6 +338,10 @@ if __name__ == '__main__':
             split_by_library=Config.PrioritizationConfig.split_by_library,
             write_global_table=Config.PrioritizationConfig.write_global_table,
             library_key_filter=Config.PrioritizationConfig.library_key_filter,
+            liability_screening=Config.PrioritizationConfig.liability_screening,
+            liability_ncpu=Config.PrioritizationConfig.liability_ncpu,
+            liability_batch_size=Config.PrioritizationConfig.liability_batch_size,
+            liability_bit_score_threshold=Config.PrioritizationConfig.liability_bit_score_threshold,
         )
     
         for output_name, output_path in prioritization_outputs.items():

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from .liability import LIABILITY_OUTPUT_COLUMNS, add_liability_columns
 from .metadata import build_sample_metadata, discover_annotated_files
 from .uid import append_seq_uid_column, clean_str
 
@@ -65,9 +66,8 @@ CORE_SEQUENCE_COLUMNS = [
     "L_FL_DNA",
 ]
 
-# Reduced 11-class amino-acid alphabet agreed for similarity inspection:
-# DE / ILV / A / NQ / RHK / ST / C / P / G / M / F / W / Y 
-
+# Reduced 13-class amino-acid alphabet used for similarity inspection:
+# DE / ILV / A / NQ / RHK / ST / C / P / G / M / F / W / Y
 AA_DEGENERATION_MAP = {
     "D": "B",
     "E": "B",
@@ -118,7 +118,7 @@ def make_display_id(row: pd.Series, fallback: str) -> str:
 
 
 def degenerate_sequence(value: object) -> str:
-    """Convert an amino-acid sequence to the reduced 11-class alphabet."""
+    """Convert an amino-acid sequence to the reduced 13-class alphabet."""
     sequence = re.sub(r"\s+", "", clean_str(value)).upper()
     if not sequence:
         return ""
@@ -496,6 +496,11 @@ def build_candidate_table(
     annotated: pd.DataFrame,
     metadata: pd.DataFrame,
     region_tables: Dict[str, pd.DataFrame],
+    *,
+    liability_screening: bool = True,
+    liability_ncpu: Optional[int] = None,
+    liability_batch_size: int = 5000,
+    liability_bit_score_threshold: float = 80.0,
 ) -> pd.DataFrame:
     valid = annotated[annotated["seq_uid"].astype(str).str.len() > 0].copy()
     if valid.empty:
@@ -688,6 +693,17 @@ def build_candidate_table(
                 )
             )
 
+    if liability_screening:
+        out = add_liability_columns(
+            out,
+            ncpu=liability_ncpu,
+            batch_size=liability_batch_size,
+            bit_score_threshold=liability_bit_score_threshold,
+        )
+    else:
+        for column in LIABILITY_OUTPUT_COLUMNS:
+            out[column] = ""
+
     # LLM integration is intentionally disabled in this version.
     # The old implementation loaded an external clustering table and merged all
     # non-sequence columns by seq_uid:
@@ -712,6 +728,10 @@ def build_candidate_table(
         "library_key",
         "library_type",
         "trajectory_class",
+        "Status",
+        "Chain",
+        "Liabilities",
+        "Details",
     ]
     front = [column for column in front if column in out.columns]
     return out[front + [column for column in out.columns if column not in front]]
@@ -865,6 +885,10 @@ def run_prioritization(
     split_by_library: bool = True,
     write_global_table: bool = False,
     library_key_filter: Optional[str] = None,
+    liability_screening: bool = True,
+    liability_ncpu: Optional[int] = None,
+    liability_batch_size: int = 5000,
+    liability_bit_score_threshold: float = 80.0,
 ) -> Dict[str, Path]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -904,6 +928,10 @@ def run_prioritization(
             annotated,
             global_metadata,
             region_tables,
+            liability_screening=liability_screening,
+            liability_ncpu=liability_ncpu,
+            liability_batch_size=liability_batch_size,
+            liability_bit_score_threshold=liability_bit_score_threshold,
         )
 
         candidate_path = output / "candidate_prioritization_table.csv"
@@ -987,6 +1015,10 @@ def run_prioritization(
                 annotated,
                 library_metadata,
                 region_tables,
+                liability_screening=liability_screening,
+                liability_ncpu=liability_ncpu,
+                liability_batch_size=liability_batch_size,
+                liability_bit_score_threshold=liability_bit_score_threshold,
             )
 
             candidate_path = (
@@ -1073,6 +1105,11 @@ def run_prioritization(
         "split_by_library": split_by_library,
         "write_global_table": bool(write_global_table),
         "library_key_filter": library_key_filter or "",
+        "liability_screening": bool(liability_screening),
+        "liability_ncpu": liability_ncpu,
+        "liability_batch_size": int(liability_batch_size),
+        "liability_bit_score_threshold": float(liability_bit_score_threshold),
+        "liability_output_columns": list(LIABILITY_OUTPUT_COLUMNS),
         "libraries": manifest_records,
     }
     manifest_path = output / "run_manifest.json"
@@ -1147,6 +1184,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "library_key contains this text"
         ),
     )
+    parser.add_argument(
+        "--no-liability-screening",
+        action="store_true",
+        help="Do not append Status/Chain/Liabilities/Details columns",
+    )
+    parser.add_argument(
+        "--liability-ncpu",
+        type=int,
+        default=None,
+        help="CPU count for batch ANARCI liability numbering",
+    )
+    parser.add_argument(
+        "--liability-batch-size",
+        type=int,
+        default=5000,
+        help="Unique H/L sequences per liability ANARCI batch",
+    )
+    parser.add_argument(
+        "--liability-bit-score-threshold",
+        type=float,
+        default=80.0,
+        help="ANARCI bit-score threshold used by liability screening",
+    )
     return parser
 
 
@@ -1162,6 +1222,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         split_by_library=not args.no_split_by_library,
         write_global_table=args.write_global_table,
         library_key_filter=args.library_key,
+        liability_screening=not args.no_liability_screening,
+        liability_ncpu=args.liability_ncpu,
+        liability_batch_size=args.liability_batch_size,
+        liability_bit_score_threshold=args.liability_bit_score_threshold,
     )
 
     print("FAO2 prioritization complete.")
